@@ -1,0 +1,8 @@
+{
+  "name": "Agora-Scholar",
+  "version": "0.1.0",
+  "author": "Fernando Serena",
+  "email": "fernando.serena@centeropenmiddleware.com",
+  "github": "https://github.com/smartdeveloperhub/agora-stoa.git",
+  "description": "The service responsible for providing access to data fragments from a Linked Data Platform powered by Agora"
+}
