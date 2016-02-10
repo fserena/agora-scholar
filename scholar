@@ -26,10 +26,14 @@
 from agora.stoa.server.bootstrap import bootstrap
 import agora.scholar
 
+import os
+
 __author__ = 'Fernando Serena'
 
 
-bootstrap(config='agora.scholar.server.config.DevelopmentConfig',
+scholar_config = os.environ.get('SCHOLAR_CONFIG', 'agora.scholar.server.config.DevelopmentConfig')
+
+bootstrap(config=scholar_config,
           modules=[('query', 'agora.scholar.actions.query'),
                    ('stream', 'agora.scholar.actions.stream')],
           metadata_pkg=agora.scholar,
