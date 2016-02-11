@@ -31,8 +31,8 @@ __author__ = 'Fernando Serena'
 
 def _params_conf(def_on_demand_th, def_sync_time, def_frag_collectors, def_max_conc_fragments, def_max_conc_deliveries,
                  def_collect_throttling):
-    return {'on_demand_threshold': float(os.environ.get('CURATOR_DEMAND_TH', def_on_demand_th)),
-            'min_sync_time': int(os.environ.get('CURATOR_MIN_SYNC_TIME', def_sync_time)),
+    return {'on_demand_threshold': float(os.environ.get('COLLECT_ON_DEMAND_TH', def_on_demand_th)),
+            'min_sync_time': int(os.environ.get('FRAGMENT_MIN_SYNC_TIME', def_sync_time)),
             'fragment_collectors': int(os.environ.get('N_FRAGMENT_COLLECTORS', def_frag_collectors)),
             'max_concurrent_fragments': int(os.environ.get('MAX_CONCURRENT_FRAGMENTS', def_max_conc_fragments)),
             'max_concurrent_deliveries': int(os.environ.get('MAX_CONCURRENT_DELIVERIES', def_max_conc_deliveries)),
