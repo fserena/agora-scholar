@@ -26,10 +26,13 @@ import json
 import logging
 from datetime import datetime
 
-from agora.scholar.daemons.fragment import FragmentPlugin
-from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentResponse, FragmentSink
+from agora.scholar.daemons.fragment import FragmentPlugin, is_fragment_synced, fragment_graph
+from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
+from agora.scholar.actions import FragmentConsumerResponse
 from agora.stoa.actions.core.utils import chunks
-
+from rdflib import Literal
+from rdflib.namespace import XSD
+from agora.stoa.store.triples import cache
 
 __author__ = 'Fernando Serena'
 
@@ -108,7 +111,7 @@ class QuerySink(FragmentSink):
 
     def _save(self, action):
         super(QuerySink, self)._save(action)
-        if self.backed:
+        if is_fragment_synced(self.fragment_id):
             log.debug('Request {} is already backed'.format(self._request_id))
             self.delivery = 'ready'
 
@@ -116,7 +119,7 @@ class QuerySink(FragmentSink):
         super(QuerySink, self)._load()
 
 
-class QueryResponse(FragmentResponse):
+class QueryResponse(FragmentConsumerResponse):
     def __init__(self, rid):
         self.__sink = QuerySink()
         self.__sink.load(rid)
@@ -127,7 +130,7 @@ class QueryResponse(FragmentResponse):
         return self.__sink
 
     def _build(self):
-        fragment, _ = self.fragment(result_set=True)
+        fragment = self.fragment()
         log.debug('Building a query result for request number {}'.format(self._request_id))
 
         try:
@@ -145,7 +148,8 @@ class QueryResponse(FragmentResponse):
                     yield json.dumps(result_rows), {'state': 'streaming', 'source': 'store',
                                                     'response_to': self.sink.message_id,
                                                     'submitted_on': calendar.timegm(datetime.now().timetuple()),
-                                                    'submitted_by': self.sink.submitted_by}
+                                                    'submitted_by': self.sink.submitted_by,
+                                                    'format': 'json'}
         except Exception, e:
             log.error(e.message)
             raise
@@ -153,3 +157,20 @@ class QueryResponse(FragmentResponse):
             yield '', {'state': 'end'}
         self.sink.delivery = 'sent'
 
+    def fragment(self):
+        def __transform(x):
+            if x.startswith('"'):
+                return Literal(x.replace('"', ''), datatype=XSD.string).n3(cache.namespace_manager)
+            return x
+
+        gp = [' '.join([__transform(self.sink.map(part)) for part in tp.split(' ')]) for tp in self.sink.gp]
+        where_gp = ' . '.join(gp)
+        # TODO: Consider using selective OPTIONAL clauses
+        query = """SELECT %s WHERE { %s }""" % (' '.join(self.sink.preferred_labels), where_gp)
+
+        result = []
+        try:
+            result = fragment_graph(self.sink.fragment_id).query(query)
+        except Exception, e:  # ParseException from query
+            log.warning(e.message)
+        return result

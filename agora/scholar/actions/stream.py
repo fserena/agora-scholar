@@ -23,15 +23,17 @@
 """
 import calendar
 import logging
-from datetime import datetime as dt
+from datetime import datetime as dt, datetime
 
 from redis.lock import Lock
-from agora.scholar.daemons.fragment import FragmentPlugin, map_variables
+
+from agora.scholar.actions import FragmentConsumerResponse
+from agora.scholar.daemons.fragment import FragmentPlugin, map_variables, is_fragment_synced, fragment_contexts
+from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
+from agora.stoa.actions.core.utils import parse_bool, chunks
 from agora.stoa.messaging.reply import reply
 from agora.stoa.store import r
-
-from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentResponse, FragmentSink
-from agora.stoa.actions.core.utils import parse_bool, chunks
+from agora.stoa.store.triples import load_stream_triples, cache
 
 __author__ = 'Fernando Serena'
 
@@ -49,7 +51,10 @@ class StreamPlugin(FragmentPlugin):
             return
         if sink.stream:
             log.debug('[{}] Streaming fragment triple...'.format(sink.request_id))
-            reply((c, s.n3(), p.n3(), o.n3()), headers={'source': 'stream'},
+            reply((c, s.n3(), p.n3(), o.n3()), headers={'source': 'stream', 'format': 'tuple', 'state': 'streaming',
+                                                        'response_to': sink.message_id,
+                                                        'submitted_on': calendar.timegm(datetime.now().timetuple()),
+                                                        'submitted_by': sink.submitted_by},
                   **sink.recipient)
 
     def complete(self, fid, *args):
@@ -140,7 +145,7 @@ class StreamSink(FragmentSink):
         log.info('Request {} stream state is now "{}"'.format(self._request_id, value))
 
 
-class StreamResponse(FragmentResponse):
+class StreamResponse(FragmentConsumerResponse):
     def __init__(self, rid):
         self.__sink = StreamSink()
         self.__sink.load(rid)
@@ -161,7 +166,7 @@ class StreamResponse(FragmentResponse):
         lock.acquire()
         fragment = None
         try:
-            fragment, stream = self.fragment(stream=True, timestamp=timestamp)
+            fragment, stream = self.fragment(timestamp=timestamp)
             if stream:
                 self.sink.stream = True
                 if fragment:
@@ -190,7 +195,10 @@ class StreamResponse(FragmentResponse):
                 if ch:
                     yield [(map_variables(c, self.sink.mapping), s.n3(), p.n3(), o.n3()) for
                            (c, s, p, o)
-                           in ch], {'source': 'store'}
+                           in ch], {'source': 'store', 'format': 'tuple', 'state': 'streaming',
+                                    'response_to': self.sink.message_id,
+                                    'submitted_on': calendar.timegm(datetime.now().timetuple()),
+                                    'submitted_by': self.sink.submitted_by}
 
             lock.acquire()
             try:
@@ -203,3 +211,23 @@ class StreamResponse(FragmentResponse):
                     self.sink.delivery = 'streaming'
             finally:
                 lock.release()
+
+    def fragment(self, timestamp):
+        def __read_contexts():
+            contexts = fragment_contexts(self.sink.fragment_id)
+            triple_patterns = {context: eval(context)[1] for context in contexts}
+            # Yield triples for each known triple pattern context
+            for context in contexts:
+                for (s, p, o) in cache.get_context(context):
+                    yield triple_patterns[context], s, p, o
+
+        if timestamp is None:
+            timestamp = calendar.timegm(dt.now().timetuple())
+
+        from_streaming = not is_fragment_synced(self.sink.fragment_id)
+
+        if from_streaming:
+            triples = load_stream_triples(self.sink.fragment_id, timestamp)
+            return triples, True
+        else:
+            return __read_contexts(), from_streaming
