@@ -21,5 +21,35 @@
   limitations under the License.
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=#
 """
+import logging
+import traceback
+from abc import abstractmethod
+
+from agora.scholar.daemons.fragment import fragment_consumer_lock
+from agora.stoa.actions.core.fragment import FragmentResponse
 
 __author__ = 'Fernando Serena'
+
+log = logging.getLogger('agora.scholar.actions')
+
+
+class FragmentConsumerResponse(FragmentResponse):
+    def __init__(self, rid):
+        super(FragmentConsumerResponse, self).__init__(rid)
+
+    def build(self):
+        c_lock = fragment_consumer_lock(self.sink.fragment_id)
+        c_lock.acquire()
+        generator = self._build()
+        try:
+            for response in generator:
+                yield response
+        except Exception, e:
+            traceback.print_exc()
+            log.error(e.message)
+        finally:
+            c_lock.release()
+
+    @abstractmethod
+    def _build(self):
+        yield None
