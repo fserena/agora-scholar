@@ -35,7 +35,7 @@ from redis.lock import Lock
 from abc import abstractmethod, abstractproperty
 from agora.client.namespaces import AGORA
 from agora.client.wrapper import Agora
-from agora.scholar.store.triples import cache, add_stream_triple, load_stream_triples, graph_provider
+from agora.stoa.store.triples import cache, add_stream_triple, load_stream_triples, graph_provider
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
@@ -75,6 +75,16 @@ log.info('Releasing registered fragments...')
 fragment_consumers = r.keys('fragments:*:consumers')
 for fck in fragment_consumers:
     r.delete(fck)
+
+
+def fragment_consumer_lock(fid):
+    lock_consume_key = 'fragments:{}:lock:consume'.format(fid)
+    return r.lock(lock_consume_key, lock_class=Lock)
+
+
+def _fragment_lock(fid):
+    lock_key = 'fragments:{}:lock'.format(fid)
+    return r.lock(lock_key, lock_class=Lock)
 
 
 class FragmentPlugin(object):
@@ -226,8 +236,7 @@ def __cache_plan_context(fid, graph):
 
 def __remove_fragment(fid):
     log.debug('Waiting to remove fragment {}...'.format(fid))
-    lock_key = 'fragments:{}:lock'.format(fid)
-    lock = r.lock(lock_key, lock_class=Lock)
+    lock = _fragment_lock(fid)
     lock.acquire()
 
     with r.pipeline(transaction=True) as p:
@@ -285,12 +294,10 @@ def __pull_fragment(fid):
     fragment_contexts = {tpn: (fid, triple_patterns[tpn]) for tpn in triple_patterns}
     __bind_prefixes(graph)
 
-    lock_key = 'fragments:{}:lock'.format(fid)
-    lock = r.lock(lock_key, lock_class=Lock)
+    lock = _fragment_lock(fid)
     lock.acquire()
 
-    lock_consume_key = 'fragments:{}:lock:consume'.format(fid)
-    c_lock = r.lock(lock_consume_key, lock_class=Lock)
+    c_lock = fragment_consumer_lock(fid)
     c_lock.acquire()
 
     # Update fragment contexts
@@ -389,6 +396,29 @@ def __collect_fragments():
                 futures[fid] = thp.submit(__pull_fragment, fid)
         time.sleep(1)
 
+
+def fragment_updated_on(fid):
+    return r.get('fragments:{}:updated'.format(fid))
+
+
+def fragment_on_demand(fid):
+    return r.get('fragments:{}:on_demand'.format(fid))
+
+
+def is_pulling(fid):
+    return r.get('fragments:{}:pulling'.format(fid)) is not None
+
+
+def fragment_contexts(fid):
+    return r.smembers('fragments:{}:contexts'.format(fid))
+
+
+def is_fragment_synced(fid):
+    return fragment_updated_on(fid) is not None
+
+
+def fragment_graph(fid):
+    return cache.get_context('/' + fid)
 
 th = Thread(target=__collect_fragments)
 th.daemon = True
