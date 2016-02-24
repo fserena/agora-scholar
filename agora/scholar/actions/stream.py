@@ -28,7 +28,10 @@ from datetime import datetime as dt, datetime
 from redis.lock import Lock
 
 from agora.scholar.actions import FragmentConsumerResponse
-from agora.scholar.daemons.fragment import FragmentPlugin, map_variables, is_fragment_synced, fragment_contexts
+from agora.scholar.daemons.fragment import FragmentPlugin, map_variables, match_filter, is_fragment_synced, \
+    fragment_contexts
+from agora.scholar.daemons.fragment import fragment_lock
+from agora.stoa.actions.core import STOA
 from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
 from agora.stoa.actions.core.utils import parse_bool, chunks
 from agora.stoa.messaging.reply import reply
@@ -47,24 +50,38 @@ class StreamPlugin(FragmentPlugin):
 
     def consume(self, fid, (c, s, p, o), graph, *args):
         sink = args[0]
-        if sink.delivery == 'sent':
-            return
-        if sink.stream:
-            log.debug('[{}] Streaming fragment triple...'.format(sink.request_id))
-            reply((c, s.n3(), p.n3(), o.n3()), headers={'source': 'stream', 'format': 'tuple', 'state': 'streaming',
-                                                        'response_to': sink.message_id,
-                                                        'submitted_on': calendar.timegm(datetime.now().timetuple()),
-                                                        'submitted_by': sink.submitted_by},
-                  **sink.recipient)
+        sink.lock.acquire()
+        try:
+            # Prevent from consuming a triple when the delivery state says it was completely sent
+            # Anyway, this HAS TO BE REMOVED from here, because the stream flag should be enough
+            if sink.delivery == 'sent':
+                return
+
+            # Proceed only if the stream flag is enabled
+            if sink.stream:
+                log.debug('[{}] Streaming fragment triple...'.format(sink.request_id))
+                reply((c, s.n3(), p.n3(), o.n3()), headers={'source': 'stream', 'format': 'tuple', 'state': 'streaming',
+                                                            'response_to': sink.message_id,
+                                                            'submitted_on': calendar.timegm(datetime.now().timetuple()),
+                                                            'submitted_by': sink.submitted_by},
+                      **sink.recipient)
+        finally:
+            sink.lock.release()
 
     def complete(self, fid, *args):
         sink = args[0]
-        sink.stream = False
-        if sink.delivery == 'streaming':
-            log.debug('Sending end stream signal after {}'.format(sink.delivery))
-            sink.delivery = 'sent'
-            reply((), headers={'state': 'end'}, **sink.recipient)
-            log.info('Stream of fragment {} for request {} is done'.format(fid, sink.request_id))
+
+        sink.lock.acquire()
+        try:
+            # At this point, the stream flag is disabled, and the delivery state might need to be updated
+            sink.stream = False
+            if sink.delivery == 'streaming':
+                log.debug('Sending end stream signal after {}'.format(sink.delivery))
+                sink.delivery = 'sent'
+                reply((), headers={'state': 'end'}, **sink.recipient)
+                log.info('Stream of fragment {} for request {} is done'.format(fid, sink.request_id))
+        finally:
+            sink.lock.release()
 
 
 FragmentPlugin.register(StreamPlugin)
@@ -74,26 +91,18 @@ class StreamRequest(FragmentRequest):
     def __init__(self):
         super(StreamRequest, self).__init__()
 
-    def _extract_content(self):
-        super(StreamRequest, self)._extract_content()
-
-        q_res = self._graph.query("""SELECT ?node WHERE {
-                                        ?node a stoa:StreamRequest .
-                                    }""")
-
-        q_res = list(q_res)
-        if len(q_res) != 1:
-            raise SyntaxError('Invalid query request')
-
-        request_fields = q_res.pop()
-        if not all(request_fields):
-            raise ValueError('Missing fields for stream request')
-        if request_fields[0] != self._request_node:
-            raise SyntaxError('Request node does not match')
+    def _extract_content(self, request_type=STOA.StreamRequest):
+        """
+        Parse streaming request data. For this operation, there is no additional data to extract.
+        """
+        super(StreamRequest, self)._extract_content(request_type=request_type)
 
 
 class StreamAction(FragmentAction):
     def __init__(self, message):
+        """
+        Prepare request and sink objects before starting initialization
+        """
         self.__request = StreamRequest()
         self.__sink = StreamSink()
         super(StreamAction, self).__init__(message)
@@ -111,44 +120,59 @@ class StreamAction(FragmentAction):
         return self.__request
 
     def submit(self):
-        try:
-            super(StreamAction, self).submit()
-        except Exception as e:
-            log.debug('Bad request: {}'.format(e.message))
-            self._reply_failure(e.message)
+        super(StreamAction, self).submit()
+        # A stream request is ready just after its submission
+        self.sink.delivery = 'ready'
 
 
 class StreamSink(FragmentSink):
+    """
+    Extends FragmentSink by adding a new property that helps to manage the stream state
+    """
+
     def _remove(self, pipe):
         super(StreamSink, self)._remove(pipe)
+        pipe.delete('{}lock'.format(self._request_key))
 
     def __init__(self):
         super(StreamSink, self).__init__()
+        self.__lock = None
 
     def _save(self, action):
         super(StreamSink, self)._save(action)
-        self.delivery = 'ready'
 
     def _load(self):
         super(StreamSink, self)._load()
+        # Create the request lock
+        lock_key = '{}lock'.format(self._request_key)
+        self.__lock = r.lock(lock_key, lock_class=Lock)
 
     @property
     def stream(self):
-        return parse_bool(r.hget('requests:{}'.format(self._request_id), '__stream'))
+        return parse_bool(r.hget('{}'.format(self._request_key), '__stream'))
 
     @stream.setter
     def stream(self, value):
         with r.pipeline(transaction=True) as p:
             p.multi()
-            p.hset('requests:{}'.format(self._request_id), '__stream', value)
+            p.hset('{}'.format(self._request_key), '__stream', value)
             p.execute()
         log.info('Request {} stream state is now "{}"'.format(self._request_id, value))
+
+    @property
+    def lock(self):
+        """
+        Helps to manage request stream and delivery status from both plugin events and build response times
+        :return: A redis-based lock object for a given request
+        """
+        return self.__lock
 
 
 class StreamResponse(FragmentConsumerResponse):
     def __init__(self, rid):
         self.__sink = StreamSink()
         self.__sink.load(rid)
+        self.__fragment_lock = fragment_lock(self.__sink.fragment_id)
         super(StreamResponse, self).__init__(rid)
 
     @property
@@ -157,17 +181,17 @@ class StreamResponse(FragmentConsumerResponse):
 
     def _build(self):
         """
-        This function does not yield anything only when the new state is 'streaming'
-        :return:
+        This function yields nothing only when the new state is 'streaming'
+        :return: Quads like (context, subject, predicate, object)
         """
 
         timestamp = calendar.timegm(dt.now().timetuple())
-        lock = r.lock('fragments:{}:lock'.format(self.sink.fragment_id), lock_class=Lock)
-        lock.acquire()
         fragment = None
+
+        self.sink.lock.acquire()
         try:
-            fragment, stream = self.fragment(timestamp=timestamp)
-            if stream:
+            fragment, streaming = self.fragment(timestamp=timestamp)
+            if streaming:
                 self.sink.stream = True
                 if fragment:
                     self.sink.delivery = 'mixing'
@@ -187,33 +211,46 @@ class StreamResponse(FragmentConsumerResponse):
             self.sink.stream = True
             self.sink.delivery = 'streaming'
         finally:
-            lock.release()
+            self.sink.lock.release()
 
         if fragment:
             log.info('Building a stream result from cache for request number {}...'.format(self._request_id))
-            for ch in chunks(fragment, 1000):
-                if ch:
-                    yield [(map_variables(c, self.sink.mapping), s.n3(), p.n3(), o.n3()) for
-                           (c, s, p, o)
-                           in ch], {'source': 'store', 'format': 'tuple', 'state': 'streaming',
-                                    'response_to': self.sink.message_id,
-                                    'submitted_on': calendar.timegm(datetime.now().timetuple()),
-                                    'submitted_by': self.sink.submitted_by}
-
-            lock.acquire()
+            filter_mapping = self.sink.filter_mapping
+            self.__fragment_lock.acquire()
             try:
-                if self.sink.delivery == 'pushing' or (self.sink.delivery == 'mixing' and not self.sink.stream):
-                    self.sink.delivery = 'sent'
-                    log.info(
-                        'The response stream of request {} is completed. Notifying...'.format(self.sink.request_id))
-                    yield (), {'state': 'end'}
-                elif self.sink.delivery == 'mixing' and self.sink.stream:
-                    self.sink.delivery = 'streaming'
+                for ch in chunks(fragment, 1000):
+                    if ch:
+                        for (c, s, p, o) in ch:
+                            real_context = map_variables(c, self.sink.mapping, filter_mapping)
+                            consume = True
+                            if self.sink.map(c[2]) in filter_mapping:
+                                consume = match_filter(o, real_context[2])
+                            if consume and self.sink.map(c[0]) in filter_mapping:
+                                consume = match_filter(s, real_context[0])
+                            if consume:
+                                yield (real_context, s.n3(), p.n3(), o.n3()), {'source': 'store', 'format': 'tuple',
+                                                                               'state': 'streaming',
+                                                                               'response_to': self.sink.message_id,
+                                                                               'submitted_on': calendar.timegm(
+                                                                                   datetime.now().timetuple()),
+                                                                               'submitted_by': self.sink.submitted_by}
             finally:
-                lock.release()
+                self.__fragment_lock.release()
+
+        self.sink.lock.acquire()
+        try:
+            if self.sink.delivery == 'pushing' or (self.sink.delivery == 'mixing' and not self.sink.stream):
+                self.sink.delivery = 'sent'
+                log.info(
+                    'The response stream of request {} is completed. Notifying...'.format(self.sink.request_id))
+                yield (), {'state': 'end'}
+            elif self.sink.delivery == 'mixing' and self.sink.stream:
+                self.sink.delivery = 'streaming'
+        finally:
+            self.sink.lock.release()
 
     def fragment(self, timestamp):
-        def __read_contexts():
+        def __load_contexts():
             contexts = fragment_contexts(self.sink.fragment_id)
             triple_patterns = {context: eval(context)[1] for context in contexts}
             # Yield triples for each known triple pattern context
@@ -224,10 +261,11 @@ class StreamResponse(FragmentConsumerResponse):
         if timestamp is None:
             timestamp = calendar.timegm(dt.now().timetuple())
 
-        from_streaming = not is_fragment_synced(self.sink.fragment_id)
+        self.__fragment_lock.acquire()
+        try:
+            from_streaming = not is_fragment_synced(self.sink.fragment_id)
 
-        if from_streaming:
-            triples = load_stream_triples(self.sink.fragment_id, timestamp)
-            return triples, True
-        else:
-            return __read_contexts(), from_streaming
+            return (load_stream_triples(self.sink.fragment_id, timestamp), True) if from_streaming else (
+                __load_contexts(), False)
+        finally:
+            self.__fragment_lock.release()

@@ -35,16 +35,18 @@ from redis.lock import Lock
 from abc import abstractmethod, abstractproperty
 from agora.client.namespaces import AGORA
 from agora.client.wrapper import Agora
-from agora.stoa.store.triples import cache, add_stream_triple, load_stream_triples, graph_provider
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
+from agora.stoa.store.triples import cache, add_stream_triple, load_stream_triples, graph_provider
 from concurrent.futures.thread import ThreadPoolExecutor
 from rdflib import RDF, RDFS
 
 __author__ = 'Fernando Serena'
 
 log = logging.getLogger('agora.scholar.daemons.fragment')
+
+# Load environment variables
 agora_client = Agora(**app.config['AGORA'])
 ON_DEMAND_TH = float(app.config.get('PARAMS', {}).get('on_demand_threshold', 2.0))
 MIN_SYNC = int(app.config.get('PARAMS', {}).get('min_sync_time', 10))
@@ -59,6 +61,7 @@ log.info("""Fragment daemon setup:
                     - Maximum concurrent fragments: {}""".format(ON_DEMAND_TH, MIN_SYNC, N_COLLECTORS,
                                                                  MAX_CONCURRENT_FRAGMENTS))
 
+# Fragment collection threadpool
 thp = ThreadPoolExecutor(max_workers=min(8, MAX_CONCURRENT_FRAGMENTS))
 
 log.info('Cleaning fragment locks...')
@@ -71,42 +74,31 @@ fragment_pullings = r.keys('fragments:*:pulling')
 for fpk in fragment_pullings:
     r.delete(fpk)
 
-log.info('Releasing registered fragments...')
-fragment_consumers = r.keys('fragments:*:consumers')
-for fck in fragment_consumers:
-    r.delete(fck)
 
-
-def fragment_consumer_lock(fid):
-    lock_consume_key = 'fragments:{}:lock:consume'.format(fid)
-    return r.lock(lock_consume_key, lock_class=Lock)
-
-
-def _fragment_lock(fid):
+def fragment_lock(fid):
+    """
+    :param fid: Fragment id
+    :return: A redis-based lock object for a given fragment
+    """
     lock_key = 'fragments:{}:lock'.format(fid)
     return r.lock(lock_key, lock_class=Lock)
 
 
 class FragmentPlugin(object):
+    """
+    Abstract class to be implemented for each action that requires to be notified after each fragment
+    collection event, e.g. new triple found
+    """
+
+    # Plugins list, all of them will be notified in order
     __plugins = []
-
-    @abstractmethod
-    def consume(self, fid, quad, graph, *args):
-        pass
-
-    @abstractmethod
-    def complete(self, fid, *args):
-        pass
-
-    @abstractproperty
-    def sink_class(self):
-        pass
-
-    def sink_aware(self):
-        return True
 
     @classmethod
     def register(cls, p):
+        """
+        Register a fragment plugin (they all should be subclasses of FragmentPlugin)
+        :param p: Plugin
+        """
         if issubclass(p, cls):
             cls.__plugins.append(p())
         else:
@@ -114,26 +106,116 @@ class FragmentPlugin(object):
 
     @classmethod
     def plugins(cls):
+        """
+        :return: The list of registered plugins
+        """
         return cls.__plugins[:]
+
+    @abstractmethod
+    def consume(self, fid, quad, graph, *args):
+        """
+        This method will be invoked just after a new fragment triple is found
+        :param fid: Fragment id
+        :param quad: (context, subject, predicate, object)
+        :param graph: The search plan graph that 
+        :param args: Context arguments, e.g. sink
+        :return:
+        """
+        pass
+
+    @abstractmethod
+    def complete(self, fid, *args):
+        """
+        This method will be invoked just after a fragment is fully collected
+        :param fid: Fragment id
+        :param args: Context arguments, e.g. sink
+        """
+        pass
+
+    @abstractproperty
+    def sink_class(self):
+        """
+        The specific Sink class to work with
+        """
+        pass
+
+    def sink_aware(self):
+        return True
 
 
 def __bind_prefixes(source_graph):
+    """
+    Binds all source graph prefixes to the cache graph
+    """
     map(lambda (prefix, uri): cache.bind(prefix, uri), source_graph.namespaces())
 
 
-def map_variables(tp, mapping):
-    if mapping is None:
-        return tp
-    return tuple(map(lambda x: mapping.get(x, x), tp))
+def match_filter(elm, f):
+    """
+    Check if a given term is equal to a filter string
+    :param elm: The term
+    :param f: Filter string
+    :return: Boolean value
+    """
+    if f.startswith('"'):
+        return str(elm) == f.lstrip('"').rstrip('"')
+    elif f.startswith('<'):
+        return str(elm) == f.lstrip('<').rstrip('>')
+    return False
+
+
+def map_variables(tp, mapping=None, fmap=None):
+    """
+    Find a mapping for a given triple pattern tuple
+    :param tp: (subject, predicate, object) string-based tuple
+    :param mapping: Concrete variables' mapping dictionary
+    :param fmap: Concrete filter-variable mapping dictionary
+    :return: A mapped triple pattern
+    """
+
+    def apply_filter_map(x):
+        return x if fmap is None else fmap.get(x, x)
+
+    return tp if mapping is None else tuple(map(lambda x: apply_filter_map(mapping.get(x, x)), tp))
 
 
 def __consume_quad(fid, (c, s, p, o), graph, sinks=None):
+    """
+    Proxy all new-triple-found fragment events to the registered plugins
+    :param fid: Fragment id
+    :param graph: Search plan graph
+    :param sinks: Fragment requests' sinks
+    """
+
+    def __process_filters(sink):
+        """
+        It's very important to take into account the filter mapping of each request to not
+        notify about triples that do not fit with the actual graph pattern of each of them
+        :return: Boolean value that determines whether the triple must be sent to a specific sink-aware plugin
+        """
+        filter_mapping = sink.filter_mapping
+        real_context = map_variables(c, sink.mapping, filter_mapping)
+
+        consume = True
+        if c[2] in filter_mapping:
+            consume = match_filter(o, real_context[2])
+        if consume and c[0] in filter_mapping:
+            consume = match_filter(s, real_context[0])
+
+        return consume, real_context
+
     def __sink_consume():
+        """
+        Function for notifying sink-aware plugins
+        """
         for rid in filter(lambda _: isinstance(sinks[_], plugin.sink_class), sinks):
             sink = sinks[rid]
             try:
-                plugin.consume(fid, (map_variables(c, sink.mapping), s, p, o), graph, sink)
+                consume, real_context = __process_filters(sink)
+                if consume:
+                    plugin.consume(fid, (real_context, s, p, o), graph, sink)
             except Exception as e:
+                plugin.complete(fid, sink)
                 sink.remove()
                 yield rid
                 log.warning(e.message)
@@ -144,6 +226,7 @@ def __consume_quad(fid, (c, s, p, o), graph, sinks=None):
         except Exception as e:
             log.warning(e.message)
 
+    # In case the plugin is not sink-aware, proceed with a generic notification
     for plugin in FragmentPlugin.plugins():
         if plugin.sink_class is not None:
             invalid_sinks = list(__sink_consume())
@@ -154,13 +237,22 @@ def __consume_quad(fid, (c, s, p, o), graph, sinks=None):
 
 
 def __notify_completion(fid, sinks):
+    """
+    Notify the ending of a fragment collection to all registered plugins
+    :param fid: Fragment id
+    :param sinks: Set of dependent sinks
+    :return:
+    """
+
+    for sink in sinks.values():
+        if sink.delivery == 'accepted':
+            sink.delivery = 'ready'
+
     for plugin in FragmentPlugin.plugins():
         try:
             filtered_sinks = filter(lambda _: isinstance(sinks[_], plugin.sink_class), sinks)
             for rid in filtered_sinks:
                 sink = sinks[rid]
-                if sink.delivery == 'accepted':
-                    sink.delivery = 'ready'
                 if plugin.sink_aware:
                     plugin.complete(fid, sink)
             if not plugin.sink_aware:
@@ -169,7 +261,14 @@ def __notify_completion(fid, sinks):
             log.warning(e.message)
 
 
-def __triple_pattern(graph, c):
+def __extract_tp_from_plan(graph, c):
+    """
+
+    :param graph: Search Plan graph
+    :param c: Triple pattern node in the search plan
+    :return: A string triple representing the pattern for a given search plan triple pattern node
+    """
+
     def extract_node_id(node):
         nid = node
         if (node, RDF.type, AGORA.Variable) in graph:
@@ -194,7 +293,7 @@ def __triple_pattern(graph, c):
 #   - (fid, c): Triple pattern based fragment data (1 context per triple pattern, c)
 
 
-def __replace_fragment(fid):
+def __update_fragment_cache(fid):
     """
     Recreate fragment <fid> cached data and all its data-contexts from the corresponding stream (Redis)
     :param fid:
@@ -203,7 +302,7 @@ def __replace_fragment(fid):
     tps = cache.get_context(fid).subjects(RDF.type, AGORA.TriplePattern)
     cache.remove_context(cache.get_context('/' + fid))
     for tp in tps:
-        cache.remove_context(cache.get_context(str((fid, __triple_pattern(cache, tp)))))
+        cache.remove_context(cache.get_context(str((fid, __extract_tp_from_plan(cache, tp)))))
     fragment_triples = load_stream_triples(fid, calendar.timegm(dt.now().timetuple()))
     for c, s, p, o in fragment_triples:
         cache.get_context(str((fid, c))).add((s, p, o))
@@ -217,9 +316,6 @@ def __cache_plan_context(fid, graph):
     """
     Use <graph> to extract the triple patterns of the current fragment <fid> and replace them as the expected context
     (triple patterns context) in the cache graph
-    :param fid:
-    :param graph:
-    :return:
     """
     try:
         fid_context = cache.get_context(fid)
@@ -235,25 +331,36 @@ def __cache_plan_context(fid, graph):
 
 
 def __remove_fragment(fid):
+    """
+    Completely remove a fragment from the system after notifying its known consumers
+    :param fid: Fragment identifier
+    """
     log.debug('Waiting to remove fragment {}...'.format(fid))
-    lock = _fragment_lock(fid)
+    lock = fragment_lock(fid)
     lock.acquire()
 
+    r_sinks = __load_fragment_requests(fid)
+    __notify_completion(fid, r_sinks)
+    fragment_keys = r.keys('fragments:{}*'.format(fid))
     with r.pipeline(transaction=True) as p:
-        requests, r_sinks = __load_fragment_requests(fid)
-        __notify_completion(fid, r_sinks)
-        fragment_keys = r.keys('fragments:{}*'.format(fid))
+        p.multi()
         map(lambda k: p.delete(k), fragment_keys)
         p.srem('fragments', fid)
         p.execute()
 
+    # Fragment lock key was just implicitly removed, so it's not necessary to release the lock
+    # lock.release()
     log.info('Fragment {} has been removed'.format(fid))
 
 
 def __load_fragment_requests(fid):
-    requests_ = r.smembers('fragments:{}:requests'.format(fid))
+    """
+    Load all requests and their sinks that are related to a given fragment id
+    :param fid: Fragment id
+    :return: A dictionary of sinks of all fragment requests
+    """
     sinks_ = {}
-    for rid in requests_:
+    for rid in r.smembers('fragments:{}:requests'.format(fid)):
         try:
             sinks_[rid] = build_response(rid).sink
         except Exception, e:
@@ -263,17 +370,25 @@ def __load_fragment_requests(fid):
                 p.multi()
                 p.srem('fragments:{}:requests'.format(fid), rid)
                 p.execute()
-    return requests_, sinks_
+    return sinks_
 
 
 def __pull_fragment(fid):
+    """
+    Pull and replace (if needed) a given fragment
+    :param fid: Fragment id
+    """
+
+    # Load fragment graph pattern
     tps = r.smembers('fragments:{}:gp'.format(fid))
-    requests, r_sinks = __load_fragment_requests(fid)
+    # Load fragment requests (including their sinks)
+    r_sinks = __load_fragment_requests(fid)
     log.info("""Starting collection of fragment {}:
                     - GP: {}
-                    - Supporting: ({}) {}""".format(fid, list(tps), len(requests), list(requests)))
-    start_time = datetime.now()
+                    - Supporting: ({}) {}""".format(fid, list(tps), len(r_sinks), list(r_sinks)))
 
+    # Prepare the corresponding fragment generator and fetch the search plan
+    start_time = datetime.now()
     try:
         fgm_gen, _, graph = agora_client.get_fragment_generator('{ %s }' % ' . '.join(tps), workers=N_COLLECTORS,
                                                                 provider=graph_provider, queue_size=N_COLLECTORS)
@@ -281,7 +396,7 @@ def __pull_fragment(fid):
         log.error('Agora is not available')
         return
 
-    # There is no search plan to execute
+    # In case there is not SearchTree in the plan: notify, remove and abort collection
     if not list(graph.subjects(RDF.type, AGORA.SearchTree)):
         log.info('There is no search plan for fragment {}. Removing...'.format(fid))
         # TODO: Send additional headers notifying the reason to end
@@ -289,56 +404,64 @@ def __pull_fragment(fid):
         __remove_fragment(fid)
         return
 
-    triple_patterns = {tpn: __triple_pattern(graph, tpn) for tpn in
-                       graph.subjects(RDF.type, AGORA.TriplePattern)}
-    fragment_contexts = {tpn: (fid, triple_patterns[tpn]) for tpn in triple_patterns}
+    # Update cache graph prefixes
     __bind_prefixes(graph)
 
-    lock = _fragment_lock(fid)
-    lock.acquire()
+    # Extract triple patterns' dictionary from the search plan
+    context_tp = {tpn: __extract_tp_from_plan(graph, tpn) for tpn in
+                  graph.subjects(RDF.type, AGORA.TriplePattern)}
+    frag_contexts = {tpn: (fid, context_tp[tpn]) for tpn in context_tp}
 
-    c_lock = fragment_consumer_lock(fid)
-    c_lock.acquire()
+    lock = fragment_lock(fid)
+    lock.acquire()
 
     # Update fragment contexts
     with r.pipeline(transaction=True) as p:
         p.multi()
         p.set('fragments:{}:pulling'.format(fid), True)
         p.delete('fragments:{}:contexts'.format(fid))
-        for tpn in fragment_contexts.keys():
-            p.sadd('fragments:{}:contexts'.format(fid), fragment_contexts[tpn])
+        for tpn in context_tp.keys():
+            p.sadd('fragments:{}:contexts'.format(fid), frag_contexts[tpn])
         p.execute()
     lock.release()
 
-    c_lock.release()
-
+    # Init fragment collection counters
     n_triples = 0
     fragment_weight = 0
     fragment_delta = 0
 
     try:
+        # Iterate all fragment triples and their contexts
         for (c, s, p, o) in fgm_gen:
             pre_ts = datetime.now()
+            # Update weights and counters
             triple_weight = len(u'{}{}{}'.format(s, p, o))
             fragment_weight += triple_weight
             fragment_delta += triple_weight
-            lock.acquire()
-            if add_stream_triple(fid, triple_patterns[c], (s, p, o)):
-                __consume_quad(fid, (triple_patterns[c], s, p, o), graph, sinks=r_sinks)
-            lock.release()
+
+            # Store the triple if it was not obtained before and notify related requests
+            try:
+                if add_stream_triple(fid, context_tp[c], (s, p, o)):
+                    __consume_quad(fid, (context_tp[c], s, p, o), graph, sinks=r_sinks)
+            except Exception, e:
+                traceback.print_exc()
+
             if fragment_delta > 1000:
                 fragment_delta = 0
                 log.info('Pulling fragment {} [{} kB]'.format(fid, fragment_weight / 1000.0))
 
-            if r.scard('fragments:{}:requests'.format(fid)) != len(requests):
-                requests, r_sinks = __load_fragment_requests(fid)
+            # Update fragment requests
+            if r.scard('fragments:{}:requests'.format(fid)) != len(r_sinks):
+                r_sinks = __load_fragment_requests(fid)
+
             n_triples += 1
             post_ts = datetime.now()
             elapsed = (post_ts - pre_ts).total_seconds()
-            excess = (1.0 / COLLECT_THROTTLING) - elapsed
-            if excess > 0:
-                sleep(excess)
+            throttling = (1.0 / COLLECT_THROTTLING) - elapsed
+            if throttling > 0:
+                sleep(throttling)
     except Exception, e:
+        log.warning(e.message)
         traceback.print_exc()
 
     elapsed = (datetime.now() - start_time).total_seconds()
@@ -346,12 +469,14 @@ def __pull_fragment(fid):
         '{} triples retrieved for fragment {} in {} s [{} kB]'.format(n_triples, fid, elapsed,
                                                                       fragment_weight / 1000.0))
 
+    # Update fragment cache and its contexts
     lock.acquire()
-    c_lock.acquire()
-    __replace_fragment(fid)
+    __update_fragment_cache(fid)
     log.info('Fragment {} data has been replaced with the recently collected'.format(fid))
     __cache_plan_context(fid, graph)
     log.info('BGP context of fragment {} has been cached'.format(fid))
+
+    # Calculate sync times and update fragment flags
     with r.pipeline(transaction=True) as p:
         p.multi()
         sync_key = 'fragments:{}:sync'.format(fid)
@@ -371,7 +496,7 @@ def __pull_fragment(fid):
         p.set('fragments:{}:updated'.format(fid), dt.now())
         p.delete('fragments:{}:pulling'.format(fid))
         p.execute()
-    c_lock.release()
+
     __notify_completion(fid, r_sinks)
     lock.release()
 
@@ -420,6 +545,8 @@ def is_fragment_synced(fid):
 def fragment_graph(fid):
     return cache.get_context('/' + fid)
 
+
+# Create and start collector daemon
 th = Thread(target=__collect_fragments)
 th.daemon = True
 th.start()

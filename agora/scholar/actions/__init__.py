@@ -25,7 +25,6 @@ import logging
 import traceback
 from abc import abstractmethod
 
-from agora.scholar.daemons.fragment import fragment_consumer_lock
 from agora.stoa.actions.core.fragment import FragmentResponse
 
 __author__ = 'Fernando Serena'
@@ -38,8 +37,6 @@ class FragmentConsumerResponse(FragmentResponse):
         super(FragmentConsumerResponse, self).__init__(rid)
 
     def build(self):
-        c_lock = fragment_consumer_lock(self.sink.fragment_id)
-        c_lock.acquire()
         generator = self._build()
         try:
             for response in generator:
@@ -47,8 +44,6 @@ class FragmentConsumerResponse(FragmentResponse):
         except Exception, e:
             traceback.print_exc()
             log.error(e.message)
-        finally:
-            c_lock.release()
 
     @abstractmethod
     def _build(self):

@@ -24,60 +24,37 @@
 import calendar
 import json
 import logging
+import traceback
 from datetime import datetime
 
-from agora.scholar.daemons.fragment import FragmentPlugin, is_fragment_synced, fragment_graph
-from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
 from agora.scholar.actions import FragmentConsumerResponse
-from agora.stoa.actions.core.utils import chunks
-from rdflib import Literal
-from rdflib.namespace import XSD
-from agora.stoa.store.triples import cache
+from agora.scholar.daemons.fragment import is_fragment_synced, fragment_graph, fragment_lock
+from agora.stoa.actions.core import STOA
+from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
+from agora.stoa.actions.core.utils import chunks, tp_parts
+from shortuuid import uuid
 
 __author__ = 'Fernando Serena'
 
 log = logging.getLogger('agora.scholar.actions.query')
 
 
-class QueryPlugin(FragmentPlugin):
-    @property
-    def sink_class(self):
-        return QuerySink
-
-    def consume(self, fid, (c, s, p, o), graph, *args):
-        pass
-
-    def complete(self, fid, *args):
-        pass
-
-
-FragmentPlugin.register(QueryPlugin)
-
-
 class QueryRequest(FragmentRequest):
     def __init__(self):
         super(QueryRequest, self).__init__()
 
-    def _extract_content(self):
-        super(QueryRequest, self)._extract_content()
-
-        q_res = self._graph.query("""SELECT ?node WHERE {
-                                        ?node a stoa:QueryRequest .
-                                    }""")
-
-        q_res = list(q_res)
-        if len(q_res) != 1:
-            raise SyntaxError('Invalid query request')
-
-        request_fields = q_res.pop()
-        if not all(request_fields):
-            raise ValueError('Missing fields for query request')
-        if request_fields[0] != self._request_node:
-            raise SyntaxError('Request node does not match')
+    def _extract_content(self, request_type=STOA.QueryRequest):
+        """
+        Parse query request data. For this operation, there is no additional data to extract.
+        """
+        super(QueryRequest, self)._extract_content(request_type=request_type)
 
 
 class QueryAction(FragmentAction):
     def __init__(self, message):
+        """
+        Prepare request and sink objects before starting initialization
+        """
         self.__request = QueryRequest()
         self.__sink = QuerySink()
         super(QueryAction, self).__init__(message)
@@ -95,14 +72,18 @@ class QueryAction(FragmentAction):
         return self.__request
 
     def submit(self):
-        try:
-            super(QueryAction, self).submit()
-        except Exception as e:
-            log.debug('Bad request: {}'.format(e.message))
-            self._reply_failure(e.message)
+        """
+        If the fragment is already synced at submission time, the delivery becomes ready
+        """
+        super(QueryAction, self).submit()
+        if is_fragment_synced(self.sink.fragment_id):
+            self.sink.delivery = 'ready'
 
 
 class QuerySink(FragmentSink):
+    """
+    Query sink does not need any extra behaviour
+    """
     def _remove(self, pipe):
         super(QuerySink, self)._remove(pipe)
 
@@ -111,9 +92,6 @@ class QuerySink(FragmentSink):
 
     def _save(self, action):
         super(QuerySink, self)._save(action)
-        if is_fragment_synced(self.fragment_id):
-            log.debug('Request {} is already backed'.format(self._request_id))
-            self.delivery = 'ready'
 
     def _load(self):
         super(QuerySink, self)._load()
@@ -121,24 +99,30 @@ class QuerySink(FragmentSink):
 
 class QueryResponse(FragmentConsumerResponse):
     def __init__(self, rid):
+        # The creation of a response always require to load its corresponding sink
         self.__sink = QuerySink()
         self.__sink.load(rid)
         super(QueryResponse, self).__init__(rid)
+        self.__fragment_lock = fragment_lock(self.__sink.fragment_id)
 
     @property
     def sink(self):
         return self.__sink
 
     def _build(self):
-        fragment = self.fragment()
+        self.__fragment_lock.acquire()
+        result = self.query()
         log.debug('Building a query result for request number {}'.format(self._request_id))
 
         try:
+            # All those variables that start with '_' are not projected
+            # TODO: improve this way of selecting variables
             variables = filter(lambda x: not x.startswith('_'), map(lambda v: v.lstrip('?'),
                                                                     filter(lambda x: x.startswith('?'),
                                                                            self.sink.preferred_labels)))
 
-            for ch in chunks(fragment, 100):
+            # Query result chunking, yields JSON
+            for ch in chunks(result, 100):
                 result_rows = []
                 for t in ch:
                     if any(t):
@@ -154,23 +138,42 @@ class QueryResponse(FragmentConsumerResponse):
             log.error(e.message)
             raise
         finally:
+            self.__fragment_lock.release()
             yield '', {'state': 'end'}
+
+        # Just after sending the state:end message, the request delivery state switches to sent
         self.sink.delivery = 'sent'
 
-    def fragment(self):
+    def query(self):
+        """
+        Query the fragment using the original request graph pattern
+        :return: The query result
+        """
         def __transform(x):
+            """
+            Trick to avoid literal language tags problem, etc.
+            """
             if x.startswith('"'):
-                return Literal(x.replace('"', ''), datatype=XSD.string).n3(cache.namespace_manager)
+                var = uuid()
+                return '?%s FILTER(str(?%s) = %s)' % (var, var, x)
             return x
 
-        gp = [' '.join([__transform(self.sink.map(part)) for part in tp.split(' ')]) for tp in self.sink.gp]
+        def __make_optional(x):
+            if 'FILTER' not in x and not x.startswith('<'):
+                x = 'OPTIONAL { %s }' % x
+            return x
+
+        gp = [' '.join([__transform(self.sink.map(part, fmap=True)) for part in tp_parts(tp)]) for tp in
+              self.sink.fragment_gp]
+        gp = map(__make_optional, gp)
         where_gp = ' . '.join(gp)
-        # TODO: Consider using selective OPTIONAL clauses
+
         query = """SELECT %s WHERE { %s }""" % (' '.join(self.sink.preferred_labels), where_gp)
 
         result = []
         try:
             result = fragment_graph(self.sink.fragment_id).query(query)
         except Exception, e:  # ParseException from query
+            traceback.print_exc()
             log.warning(e.message)
         return result
