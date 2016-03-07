@@ -32,9 +32,11 @@ from time import sleep
 
 from redis.lock import Lock
 
+import networkx as nx
 from abc import abstractmethod, abstractproperty
 from agora.client.namespaces import AGORA
 from agora.client.wrapper import Agora
+from agora.stoa.actions.core.utils import tp_parts
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
@@ -158,9 +160,9 @@ def match_filter(elm, f):
     :return: Boolean value
     """
     if f.startswith('"'):
-        return str(elm) == f.lstrip('"').rstrip('"')
+        return unicode(elm) == f.lstrip('"').rstrip('"')
     elif f.startswith('<'):
-        return str(elm) == f.lstrip('<').rstrip('>')
+        return unicode(elm) == f.lstrip('<').rstrip('>')
     return False
 
 
@@ -197,9 +199,9 @@ def __consume_quad(fid, (c, s, p, o), graph, sinks=None):
         real_context = map_variables(c, sink.mapping, filter_mapping)
 
         consume = True
-        if c[2] in filter_mapping:
+        if sink.map(c[2]) in filter_mapping:
             consume = match_filter(o, real_context[2])
-        if consume and c[0] in filter_mapping:
+        if consume and sink.map(c[0]) in filter_mapping:
             consume = match_filter(s, real_context[0])
 
         return consume, real_context
@@ -215,10 +217,10 @@ def __consume_quad(fid, (c, s, p, o), graph, sinks=None):
                 if consume:
                     plugin.consume(fid, (real_context, s, p, o), graph, sink)
             except Exception as e:
+                log.warning(e.message)
                 plugin.complete(fid, sink)
                 sink.remove()
                 yield rid
-                log.warning(e.message)
 
     def __generic_consume():
         try:
@@ -293,20 +295,34 @@ def __extract_tp_from_plan(graph, c):
 #   - (fid, c): Triple pattern based fragment data (1 context per triple pattern, c)
 
 
-def __update_fragment_cache(fid):
+def graph_from_gp(gp):
+    gp_graph = nx.DiGraph()
+    gp_parts = [tp_parts(tp) for tp in gp]
+    for gp_part in gp_parts:
+        gp_graph.add_edge(gp_part[0], gp_part[2], predicate=gp_part[1])
+    return gp_graph
+
+
+def __update_fragment_cache(fid, gp):
     """
     Recreate fragment <fid> cached data and all its data-contexts from the corresponding stream (Redis)
     :param fid:
     :return:
     """
-    tps = cache.get_context(fid).subjects(RDF.type, AGORA.TriplePattern)
+    plan_tps = cache.get_context(fid).subjects(RDF.type, AGORA.TriplePattern)
     cache.remove_context(cache.get_context('/' + fid))
-    for tp in tps:
+    for tp in plan_tps:
         cache.remove_context(cache.get_context(str((fid, __extract_tp_from_plan(cache, tp)))))
+
+    gp_graph = graph_from_gp(gp)
+    roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
+
     fragment_triples = load_stream_triples(fid, calendar.timegm(dt.now().timetuple()))
     for c, s, p, o in fragment_triples:
         cache.get_context(str((fid, c))).add((s, p, o))
         cache.get_context('/' + fid).add((s, p, o))
+        if c[0] in roots:
+            cache.get_context('/' + fid).add((s, RDF.type, AGORA.Root))
     with r.pipeline() as pipe:
         pipe.delete('fragments:{}:stream'.format(fid))
         pipe.execute()
@@ -441,7 +457,10 @@ def __pull_fragment(fid):
 
             # Store the triple if it was not obtained before and notify related requests
             try:
-                if add_stream_triple(fid, context_tp[c], (s, p, o)):
+                lock.acquire()
+                new_triple = add_stream_triple(fid, context_tp[c], (s, p, o))
+                lock.release()
+                if new_triple:
                     __consume_quad(fid, (context_tp[c], s, p, o), graph, sinks=r_sinks)
             except Exception, e:
                 traceback.print_exc()
@@ -471,7 +490,7 @@ def __pull_fragment(fid):
 
     # Update fragment cache and its contexts
     lock.acquire()
-    __update_fragment_cache(fid)
+    __update_fragment_cache(fid, tps)
     log.info('Fragment {} data has been replaced with the recently collected'.format(fid))
     __cache_plan_context(fid, graph)
     log.info('BGP context of fragment {} has been cached'.format(fid))
