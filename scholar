@@ -37,4 +37,5 @@ bootstrap(config=scholar_config,
           modules=[('query', 'agora.scholar.actions.query'),
                    ('stream', 'agora.scholar.actions.stream')],
           metadata_pkg=agora.scholar,
-          logger_name='agora.scholar.bootstrap')
+          logger_name='agora.scholar.bootstrap',
+          api_ext=['agora.scholar.api'])
