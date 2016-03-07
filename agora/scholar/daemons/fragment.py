@@ -36,6 +36,7 @@ import networkx as nx
 from abc import abstractmethod, abstractproperty
 from agora.client.namespaces import AGORA
 from agora.client.wrapper import Agora
+from agora.stoa.actions.core import STOA
 from agora.stoa.actions.core.utils import tp_parts
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
@@ -322,7 +323,7 @@ def __update_fragment_cache(fid, gp):
         cache.get_context(str((fid, c))).add((s, p, o))
         cache.get_context('/' + fid).add((s, p, o))
         if c[0] in roots:
-            cache.get_context('/' + fid).add((s, RDF.type, AGORA.Root))
+            cache.get_context('/' + fid).add((s, RDF.type, STOA.Root))
     with r.pipeline() as pipe:
         pipe.delete('fragments:{}:stream'.format(fid))
         pipe.execute()
