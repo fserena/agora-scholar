@@ -78,7 +78,7 @@ class StreamPlugin(FragmentPlugin):
             if sink.delivery == 'streaming':
                 log.debug('Sending end stream signal after {}'.format(sink.delivery))
                 sink.delivery = 'sent'
-                reply((), headers={'state': 'end'}, **sink.recipient)
+                reply((), headers={'state': 'end', 'format': 'tuple'}, **sink.recipient)
                 log.info('Stream of fragment {} for request {} is done'.format(fid, sink.request_id))
         finally:
             sink.lock.release()
@@ -138,8 +138,8 @@ class StreamSink(FragmentSink):
         super(StreamSink, self).__init__()
         self.__lock = None
 
-    def _save(self, action):
-        super(StreamSink, self)._save(action)
+    def _save(self, action, general=True):
+        super(StreamSink, self)._save(action, general)
 
     def _load(self):
         super(StreamSink, self)._load()
@@ -204,7 +204,7 @@ class StreamResponse(FragmentConsumerResponse):
                 else:
                     self.sink.delivery = 'sent'
                     log.debug('Sending end stream signal since there is no fragment and stream is disabled')
-                    yield (), {'state': 'end'}
+                    yield (), {'state': 'end', 'format': 'tuple'}
                 self.sink.stream = False
         except Exception as e:
             log.warning(e.message)
@@ -220,6 +220,7 @@ class StreamResponse(FragmentConsumerResponse):
             try:
                 for ch in chunks(fragment, 1000):
                     if ch:
+                        rows = []
                         for (c, s, p, o) in ch:
                             real_context = map_variables(c, self.sink.mapping, filter_mapping)
                             consume = True
@@ -228,12 +229,13 @@ class StreamResponse(FragmentConsumerResponse):
                             if consume and self.sink.map(c[0]) in filter_mapping:
                                 consume = match_filter(s, real_context[0])
                             if consume:
-                                yield (real_context, s.n3(), p.n3(), o.n3()), {'source': 'store', 'format': 'tuple',
-                                                                               'state': 'streaming',
-                                                                               'response_to': self.sink.message_id,
-                                                                               'submitted_on': calendar.timegm(
-                                                                                   datetime.now().timetuple()),
-                                                                               'submitted_by': self.sink.submitted_by}
+                                rows.append((real_context, s.n3(), p.n3(), o.n3()))
+                        yield rows, {'source': 'store', 'format': 'tuple',
+                                     'state': 'streaming',
+                                     'response_to': self.sink.message_id,
+                                     'submitted_on': calendar.timegm(
+                                         datetime.now().timetuple()),
+                                     'submitted_by': self.sink.submitted_by}
             finally:
                 self.__fragment_lock.release()
 
@@ -243,7 +245,7 @@ class StreamResponse(FragmentConsumerResponse):
                 self.sink.delivery = 'sent'
                 log.info(
                     'The response stream of request {} is completed. Notifying...'.format(self.sink.request_id))
-                yield (), {'state': 'end'}
+                yield (), {'state': 'end', 'format': 'tuple'}
             elif self.sink.delivery == 'mixing' and self.sink.stream:
                 self.sink.delivery = 'streaming'
         finally:
