@@ -42,6 +42,7 @@ from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
 from agora.stoa.store.triples import cache, add_stream_triple, load_stream_triples, graph_provider
+from agora.stoa.store.tables import db
 from concurrent.futures.thread import ThreadPoolExecutor
 from rdflib import RDF, RDFS
 
@@ -304,6 +305,62 @@ def graph_from_gp(gp):
     return gp_graph
 
 
+def query(fid, gp):
+    """
+    Query the fragment using the original request graph pattern
+    :param gp:
+    :param fid:
+    :return: The query result
+    """
+
+    def __build_query_from(x, depth=0):
+        def build_pattern_query((u, v, data)):
+            return '\nOPTIONAL { %s %s %s %s }' % (u, data['predicate'], v, __build_query_from(v, depth + 1))
+
+        out_edges = list(gp_graph.out_edges_iter(x, data=True))
+        out_edges = reversed(sorted(out_edges, key=lambda x: gp_graph.out_degree))
+        if out_edges:
+            return ' '.join([build_pattern_query(x) for x in out_edges])
+        return ''
+
+    gp = filter(lambda x: ' a ' not in x and 'rdf:type' not in x, gp)
+    gp_parts = [tp_parts(tp) for tp in gp]
+
+    blocks = []
+    gp_graph = nx.DiGraph()
+    for gp_part in gp_parts:
+        gp_graph.add_edge(gp_part[0], gp_part[2], predicate=gp_part[1])
+
+    roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
+
+    blocks += ['%s a stoa:Root\nOPTIONAL { %s }' % (root, __build_query_from(root)) for root in roots]
+
+    where_gp = ' .\n'.join(blocks)
+    q = """SELECT DISTINCT * WHERE { %s }""" % where_gp
+    log.info(q)
+
+    result = []
+    try:
+        result = fragment_graph(fid).query(q)
+    except Exception, e:  # ParseException from query
+        traceback.print_exc()
+        log.warning(e.message)
+    return result
+
+
+def __update_result_set(fid, gp):
+    try:
+        result_gen = query(fid, gp)
+        removed = db[fid].delete_many({}).deleted_count
+        log.info('{} rows removed from fragment {} result set'.format(removed, fid))
+        table = db[fid]
+        inserted = table.insert_many(
+            [{label: row[row.labels[label]] for label in row.labels} for row in result_gen]).inserted_ids
+        log.iinfo('{} rows inserted into fragment {} result set'.format(inserted, fid))
+    except Exception, e:
+        log.error(e.message)
+
+
 def __update_fragment_cache(fid, gp):
     """
     Recreate fragment <fid> cached data and all its data-contexts from the corresponding stream (Redis)
@@ -447,6 +504,7 @@ def __pull_fragment(fid):
     fragment_weight = 0
     fragment_delta = 0
 
+    log.info('Collecting fragment {}...'.format(fid))
     try:
         # Iterate all fragment triples and their contexts
         for (c, s, p, o) in fgm_gen:
@@ -464,6 +522,7 @@ def __pull_fragment(fid):
                 if new_triple:
                     __consume_quad(fid, (context_tp[c], s, p, o), graph, sinks=r_sinks)
             except Exception, e:
+                log.warning(e.message)
                 traceback.print_exc()
 
             if fragment_delta > 1000:
@@ -491,34 +550,40 @@ def __pull_fragment(fid):
 
     # Update fragment cache and its contexts
     lock.acquire()
-    __update_fragment_cache(fid, tps)
-    log.info('Fragment {} data has been replaced with the recently collected'.format(fid))
-    __cache_plan_context(fid, graph)
-    log.info('BGP context of fragment {} has been cached'.format(fid))
+    try:
+        __update_fragment_cache(fid, tps)
+        log.info('Fragment {} data has been replaced with the recently collected'.format(fid))
+        __cache_plan_context(fid, graph)
+        log.info('BGP context of fragment {} has been cached'.format(fid))
+        log.info('Updating result set for fragment {}...'.format(fid))
+        __update_result_set(fid, tps)
 
-    # Calculate sync times and update fragment flags
-    with r.pipeline(transaction=True) as p:
-        p.multi()
-        sync_key = 'fragments:{}:sync'.format(fid)
-        demand_key = 'fragments:{}:on_demand'.format(fid)
-        # Fragment is now synced
-        p.set(sync_key, True)
-        # If the fragment collection time has not exceeded the threshold, switch to on-demand mode
-        if elapsed < ON_DEMAND_TH and elapsed * random.random() < ON_DEMAND_TH / 4:
-            p.set(demand_key, True)
-            log.info('Fragment {} has been switched to on-demand mode'.format(fid))
-        else:
-            p.delete(demand_key)
-            min_durability = int(max(MIN_SYNC, elapsed))
-            durability = random.randint(min_durability, min_durability * 2)
-            p.expire(sync_key, durability)
-            log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
-        p.set('fragments:{}:updated'.format(fid), dt.now())
-        p.delete('fragments:{}:pulling'.format(fid))
-        p.execute()
+        # Calculate sync times and update fragment flags
+        with r.pipeline(transaction=True) as p:
+            p.multi()
+            sync_key = 'fragments:{}:sync'.format(fid)
+            demand_key = 'fragments:{}:on_demand'.format(fid)
+            # Fragment is now synced
+            p.set(sync_key, True)
+            # If the fragment collection time has not exceeded the threshold, switch to on-demand mode
+            if elapsed < ON_DEMAND_TH and elapsed * random.random() < ON_DEMAND_TH / 4:
+                p.set(demand_key, True)
+                log.info('Fragment {} has been switched to on-demand mode'.format(fid))
+            else:
+                p.delete(demand_key)
+                min_durability = int(max(MIN_SYNC, elapsed))
+                durability = random.randint(min_durability, min_durability * 2)
+                p.expire(sync_key, durability)
+                log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
+            p.set('fragments:{}:updated'.format(fid), dt.now())
+            p.delete('fragments:{}:pulling'.format(fid))
+            p.execute()
 
-    __notify_completion(fid, r_sinks)
-    lock.release()
+        __notify_completion(fid, r_sinks)
+    finally:
+        lock.release()
+
+    log.info('Fragment {} collection is complete!'.format(fid))
 
 
 def __collect_fragments():
