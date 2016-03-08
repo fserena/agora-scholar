@@ -24,16 +24,15 @@
 import calendar
 import json
 import logging
-import traceback
 from datetime import datetime
 
 from agora.scholar.actions import FragmentConsumerResponse
-from agora.scholar.daemons.fragment import is_fragment_synced, fragment_graph, fragment_lock
+from agora.scholar.daemons.fragment import is_fragment_synced, fragment_lock
 from agora.stoa.actions.core import STOA
 from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
-from agora.stoa.actions.core.utils import chunks, tp_parts
-from shortuuid import uuid
-import networkx as nx
+from agora.stoa.actions.core.utils import chunks
+from agora.stoa.store.tables import db
+
 
 __author__ = 'Fernando Serena'
 
@@ -113,22 +112,16 @@ class QueryResponse(FragmentConsumerResponse):
 
     def _build(self):
         self.__fragment_lock.acquire()
-        result = self.query()
+        result = self.result_set()
         log.debug('Building a query result for request number {}'.format(self._request_id))
 
         try:
-            # All those variables that start with '_' are not projected
-            # TODO: improve this way of selecting variables
-            variables = filter(lambda x: not x.startswith('_'), map(lambda v: v.lstrip('?'),
-                                                                    filter(lambda x: x.startswith('?'),
-                                                                           self.sink.preferred_labels)))
-
             # Query result chunking, yields JSON
-            for ch in chunks(result, 10):
+            for ch in chunks(result, 100):
                 result_rows = []
                 for t in ch:
                     if any(t):
-                        result_row = {v: t[v] for v in variables}
+                        result_row = {self.sink.map('?' + v).lstrip('?'): t[v] for v in t}
                         result_rows.append(result_row)
                 if result_rows:
                     yield json.dumps(result_rows), {'state': 'streaming', 'source': 'store',
@@ -146,58 +139,23 @@ class QueryResponse(FragmentConsumerResponse):
         # Just after sending the state:end message, the request delivery state switches to sent
         self.sink.delivery = 'sent'
 
-    def query(self):
-        """
-        Query the fragment using the original request graph pattern
-        :return: The query result
-        """
+    def result_set(self):
+        def extract_fields(result):
+            for r in result:
+                yield r['_id']
 
-        def __build_query_from(x, depth=0):
-            def build_pattern_query((u, v, data)):
-                return '\nOPTIONAL { %s %s %s %s }' % (u, data['predicate'], v, __build_query_from(v, depth + 1))
+        pattern = {}
+        projection = {}
+        mapping = filter(lambda x: x.startswith('?'), self.sink.mapping)
+        for v in mapping:
+            value = self.sink.map(v, fmap=True)
+            if not value.startswith('?'):
+                pattern[v.lstrip('?')] = value.strip('"')
+            elif not value.startswith('?_'):
+                # All those variables that start with '_' won't be projected
+                projection[v.lstrip('?')] = True
 
-            out_edges = list(gp_graph.out_edges_iter(x, data=True))
-            out_edges = reversed(sorted(out_edges, key=lambda x: gp_graph.out_degree))
-            if out_edges:
-                return ' '.join([build_pattern_query(x) for x in out_edges])
-            return ''
-
-        def __transform(x):
-            """
-            Trick to avoid literal language tags problem, etc.
-            """
-            if x.startswith('"'):
-                var = uuid()
-                return '?%s FILTER(str(?%s) = %s)' % (var, var, x)
-            return x
-
-        gp = filter(lambda x: ' a ' not in x and 'rdf:type' not in x, self.sink.fragment_gp)
-        gp_parts = [[__transform(self.sink.map(part, fmap=True)) for part in tp_parts(tp)] for tp in gp]
-
-        blocks = []
-        filter_block = []
-        gp_graph = nx.DiGraph()
-        for gp_part in gp_parts:
-            if 'FILTER' not in gp_part[2]:
-                gp_graph.add_edge(gp_part[0], gp_part[2], predicate=gp_part[1])
-            else:
-                filter_block.append(' '.join(gp_part))
-
-        roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
-
-        blocks += [' %s a stoa:Root \n OPTIONAL { %s }' % (root, __build_query_from(root)) for root in roots]
-        if filter_block:
-            blocks.append('{ %s }' % ' .\n '.join(filter_block))
-
-        where_gp = ' .\n'.join(blocks)
-        projection = ' '.join(self.sink.preferred_labels) if self.sink.preferred_labels else '*'
-        query = """SELECT DISTINCT %s WHERE { %s }""" % (projection, where_gp)
-        log.debug(query)
-
-        result = []
-        try:
-            result = fragment_graph(self.sink.fragment_id).query(query)
-        except Exception, e:  # ParseException from query
-            traceback.print_exc()
-            log.warning(e.message)
-        return result
+        table = db[self.sink.fragment_id]
+        pipeline = [{"$match": {v: pattern[v] for v in pattern}},
+                    {"$group": {'_id': {v: '$' + v for v in projection}}}]
+        return extract_fields(table.aggregate(pipeline))
