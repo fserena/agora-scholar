@@ -150,7 +150,11 @@ class QueryResponse(FragmentConsumerResponse):
         for v in mapping:
             value = self.sink.map(v, fmap=True)
             if not value.startswith('?'):
-                pattern[v.lstrip('?')] = value.strip('"')
+                if value.startswith('"'):
+                    value = value.strip('"')
+                else:
+                    value = value.lstrip('<').rstrip('>')
+                pattern[v.lstrip('?')] = value
             elif not value.startswith('?_'):
                 # All those variables that start with '_' won't be projected
                 projection[v.lstrip('?')] = True
