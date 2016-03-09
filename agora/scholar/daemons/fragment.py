@@ -354,9 +354,10 @@ def __update_result_set(fid, gp):
         removed = db[fid].delete_many({}).deleted_count
         log.info('{} rows removed from fragment {} result set'.format(removed, fid))
         table = db[fid]
-        inserted = table.insert_many(
-            [{label: row[row.labels[label]] for label in row.labels} for row in result_gen]).inserted_ids
-        log.info('{} rows inserted into fragment {} result set'.format(len(inserted), fid))
+        rows = set(result_gen)
+        if rows:
+            table.insert_many([{label: row[row.labels[label]] for label in row.labels} for row in rows])
+        log.info('{} rows inserted into fragment {} result set'.format(len(rows), fid))
     except Exception, e:
         traceback.print_exc()
         log.error(e.message)
