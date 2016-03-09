@@ -36,7 +36,7 @@ import networkx as nx
 from abc import abstractmethod, abstractproperty
 from agora.client.namespaces import AGORA
 from agora.client.wrapper import Agora
-from agora.stoa.actions.core import STOA
+from agora.stoa.actions.core import STOA, AGENT_ID
 from agora.stoa.actions.core.utils import tp_parts
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
@@ -58,6 +58,8 @@ N_COLLECTORS = int(app.config.get('PARAMS', {}).get('fragment_collectors', 1))
 MAX_CONCURRENT_FRAGMENTS = int(app.config.get('PARAMS', {}).get('max_concurrent_fragments', 8))
 COLLECT_THROTTLING = max(1, int(app.config.get('PARAMS', {}).get('collect_throttling', 30)))
 
+fragments_key = '{}:fragments'.format(AGENT_ID)
+
 log.info("""Fragment daemon setup:
                     - On-demand threshold: {}
                     - Minimum sync time: {}
@@ -69,12 +71,12 @@ log.info("""Fragment daemon setup:
 thp = ThreadPoolExecutor(max_workers=min(8, MAX_CONCURRENT_FRAGMENTS))
 
 log.info('Cleaning fragment locks...')
-fragment_locks = r.keys('*lock*')
+fragment_locks = r.keys('{}:*lock*'.format(fragments_key))
 for flk in fragment_locks:
     r.delete(flk)
 
 log.info('Cleaning fragment pulling flags...')
-fragment_pullings = r.keys('fragments:*:pulling')
+fragment_pullings = r.keys('{}:*:pulling'.format(fragments_key))
 for fpk in fragment_pullings:
     r.delete(fpk)
 
@@ -84,7 +86,7 @@ def fragment_lock(fid):
     :param fid: Fragment id
     :return: A redis-based lock object for a given fragment
     """
-    lock_key = 'fragments:{}:lock'.format(fid)
+    lock_key = '{}:{}:lock'.format(fragments_key, fid)
     return r.lock(lock_key, lock_class=Lock)
 
 
@@ -384,7 +386,7 @@ def __update_fragment_cache(fid, gp):
         if c[0] in roots:
             cache.get_context('/' + fid).add((s, RDF.type, STOA.Root))
     with r.pipeline() as pipe:
-        pipe.delete('fragments:{}:stream'.format(fid))
+        pipe.delete('{}:{}:stream'.format(fragments_key, fid))
         pipe.execute()
 
 
@@ -417,11 +419,11 @@ def __remove_fragment(fid):
 
     r_sinks = __load_fragment_requests(fid)
     __notify_completion(fid, r_sinks)
-    fragment_keys = r.keys('fragments:{}*'.format(fid))
+    fragment_keys = r.keys('{}:{}*'.format(fragments_key, fid))
     with r.pipeline(transaction=True) as p:
         p.multi()
         map(lambda k: p.delete(k), fragment_keys)
-        p.srem('fragments', fid)
+        p.srem(fragments_key, fid)
         p.execute()
 
     # Fragment lock key was just implicitly removed, so it's not necessary to release the lock
@@ -436,7 +438,8 @@ def __load_fragment_requests(fid):
     :return: A dictionary of sinks of all fragment requests
     """
     sinks_ = {}
-    for rid in r.smembers('fragments:{}:requests'.format(fid)):
+    fragment_requests_key = '{}:{}:requests'.format(fragments_key, fid)
+    for rid in r.smembers(fragment_requests_key):
         try:
             sinks_[rid] = build_response(rid).sink
         except Exception, e:
@@ -444,7 +447,7 @@ def __load_fragment_requests(fid):
             log.warning(e.message)
             with r.pipeline(transaction=True) as p:
                 p.multi()
-                p.srem('fragments:{}:requests'.format(fid), rid)
+                p.srem(fragment_requests_key, rid)
                 p.execute()
     return sinks_
 
@@ -455,8 +458,10 @@ def __pull_fragment(fid):
     :param fid: Fragment id
     """
 
+    fragment_key = '{}:{}'.format(fragments_key, fid)
+
     # Load fragment graph pattern
-    tps = r.smembers('fragments:{}:gp'.format(fid))
+    tps = r.smembers('{}:gp'.format(fragment_key))
     # Load fragment requests (including their sinks)
     r_sinks = __load_fragment_requests(fid)
     log.info("""Starting collection of fragment {}:
@@ -494,10 +499,11 @@ def __pull_fragment(fid):
     # Update fragment contexts
     with r.pipeline(transaction=True) as p:
         p.multi()
-        p.set('fragments:{}:pulling'.format(fid), True)
-        p.delete('fragments:{}:contexts'.format(fid))
+        p.set('{}:pulling'.format(fragment_key), True)
+        contexts_key = '{}:contexts'.format(fragment_key)
+        p.delete(contexts_key)
         for tpn in context_tp.keys():
-            p.sadd('fragments:{}:contexts'.format(fid), frag_contexts[tpn])
+            p.sadd(contexts_key, frag_contexts[tpn])
         p.execute()
     lock.release()
 
@@ -532,7 +538,7 @@ def __pull_fragment(fid):
                 log.info('Pulling fragment {} [{} kB]'.format(fid, fragment_weight / 1000.0))
 
             # Update fragment requests
-            if r.scard('fragments:{}:requests'.format(fid)) != len(r_sinks):
+            if r.scard('f{}:requests'.format(fragment_key)) != len(r_sinks):
                 r_sinks = __load_fragment_requests(fid)
 
             n_triples += 1
@@ -563,8 +569,8 @@ def __pull_fragment(fid):
         # Calculate sync times and update fragment flags
         with r.pipeline(transaction=True) as p:
             p.multi()
-            sync_key = 'fragments:{}:sync'.format(fid)
-            demand_key = 'fragments:{}:on_demand'.format(fid)
+            sync_key = '{}:sync'.format(fragment_key)
+            demand_key = '{}:on_demand'.format(fragment_key)
             # Fragment is now synced
             p.set(sync_key, True)
             # If the fragment collection time has not exceeded the threshold, switch to on-demand mode
@@ -577,8 +583,8 @@ def __pull_fragment(fid):
                 durability = random.randint(min_durability, min_durability * 2)
                 p.expire(sync_key, durability)
                 log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
-            p.set('fragments:{}:updated'.format(fid), dt.now())
-            p.delete('fragments:{}:pulling'.format(fid))
+            p.set('{}:updated'.format(fragment_key), dt.now())
+            p.delete('{}:pulling'.format(fragment_key))
             p.execute()
 
         __notify_completion(fid, r_sinks)
@@ -589,8 +595,8 @@ def __pull_fragment(fid):
 
 
 def __collect_fragments():
-    registered_fragments = r.scard('fragments')
-    synced_fragments = len(r.keys('fragments:*:sync'))
+    registered_fragments = r.scard(fragments_key)
+    synced_fragments = len(r.keys('{}:*:sync'.format(fragments_key)))
     log.info("""Collector daemon started:
                     - Fragments: {}
                     - Synced: {}""".format(registered_fragments, synced_fragments))
@@ -598,9 +604,9 @@ def __collect_fragments():
     futures = {}
     while True:
         for fid in filter(
-                lambda x: r.get('fragments:{}:sync'.format(x)) is None and r.get(
-                    'fragments:{}:pulling'.format(x)) is None,
-                r.smembers('fragments')):
+                lambda x: r.get('{}:{}:sync'.format(fragments_key, x)) is None and r.get(
+                    '{}:{}:pulling'.format(fragments_key, x)) is None,
+                r.smembers(fragments_key)):
             if fid in futures:
                 if futures[fid].done():
                     del futures[fid]
@@ -610,19 +616,19 @@ def __collect_fragments():
 
 
 def fragment_updated_on(fid):
-    return r.get('fragments:{}:updated'.format(fid))
+    return r.get('{}:{}:updated'.format(fragments_key, fid))
 
 
 def fragment_on_demand(fid):
-    return r.get('fragments:{}:on_demand'.format(fid))
+    return r.get('{}:{}:on_demand'.format(fragments_key, fid))
 
 
 def is_pulling(fid):
-    return r.get('fragments:{}:pulling'.format(fid)) is not None
+    return r.get('{}:{}:pulling'.format((fragments_key, fid))) is not None
 
 
 def fragment_contexts(fid):
-    return r.smembers('fragments:{}:contexts'.format(fid))
+    return r.smembers('{}:{}:contexts'.format((fragments_key, fid)))
 
 
 def is_fragment_synced(fid):
