@@ -36,7 +36,7 @@ from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, Fr
 from agora.stoa.actions.core.utils import parse_bool, chunks
 from agora.stoa.messaging.reply import reply
 from agora.stoa.store import r
-from agora.stoa.store.triples import load_stream_triples, cache
+from agora.stoa.store.triples import load_stream_triples, fragments_cache
 
 __author__ = 'Fernando Serena'
 
@@ -257,7 +257,7 @@ class StreamResponse(FragmentConsumerResponse):
             triple_patterns = {context: eval(context)[1] for context in contexts}
             # Yield triples for each known triple pattern context
             for context in contexts:
-                for (s, p, o) in cache.get_context(context):
+                for (s, p, o) in fragments_cache.get_context(context):
                     yield triple_patterns[context], s, p, o
 
         if timestamp is None:

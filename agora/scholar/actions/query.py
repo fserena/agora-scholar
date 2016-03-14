@@ -27,12 +27,11 @@ import logging
 from datetime import datetime
 
 from agora.scholar.actions import FragmentConsumerResponse
-from agora.scholar.daemons.fragment import is_fragment_synced, fragment_lock
+from agora.scholar.daemons.fragment import fragment_lock, fragment_has_result_set
 from agora.stoa.actions.core import STOA
 from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
 from agora.stoa.actions.core.utils import chunks
 from agora.stoa.store.tables import db
-
 
 __author__ = 'Fernando Serena'
 
@@ -76,7 +75,7 @@ class QueryAction(FragmentAction):
         If the fragment is already synced at submission time, the delivery becomes ready
         """
         super(QueryAction, self).submit()
-        if is_fragment_synced(self.sink.fragment_id):
+        if fragment_has_result_set(self.sink.fragment_id):
             self.sink.delivery = 'ready'
 
 
@@ -117,7 +116,7 @@ class QueryResponse(FragmentConsumerResponse):
 
         try:
             # Query result chunking, yields JSON
-            for ch in chunks(result, 100):
+            for ch in chunks(result, 1000):
                 result_rows = []
                 for t in ch:
                     if any(t):
