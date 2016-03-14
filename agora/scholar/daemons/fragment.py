@@ -41,8 +41,8 @@ from agora.stoa.actions.core.utils import tp_parts
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
-from agora.stoa.store.triples import cache, add_stream_triple, load_stream_triples, graph_provider
 from agora.stoa.store.tables import db
+from agora.stoa.store.triples import fragments_cache, add_stream_triple, load_stream_triples, graph_provider
 from concurrent.futures.thread import ThreadPoolExecutor
 from rdflib import RDF, RDFS
 
@@ -57,6 +57,7 @@ MIN_SYNC = int(app.config.get('PARAMS', {}).get('min_sync_time', 10))
 N_COLLECTORS = int(app.config.get('PARAMS', {}).get('fragment_collectors', 1))
 MAX_CONCURRENT_FRAGMENTS = int(app.config.get('PARAMS', {}).get('max_concurrent_fragments', 8))
 COLLECT_THROTTLING = max(1, int(app.config.get('PARAMS', {}).get('collect_throttling', 30)))
+THROTTLING_TIME = (1.0 / (COLLECT_THROTTLING * 1000))
 
 fragments_key = '{}:fragments'.format(AGENT_ID)
 
@@ -153,7 +154,7 @@ def __bind_prefixes(source_graph):
     """
     Binds all source graph prefixes to the cache graph
     """
-    map(lambda (prefix, uri): cache.bind(prefix, uri), source_graph.namespaces())
+    map(lambda (prefix, uri): fragments_cache.bind(prefix, uri), source_graph.namespaces())
 
 
 def match_filter(elm, f):
@@ -339,10 +340,10 @@ def query(fid, gp):
 
     where_gp = ' .\n'.join(blocks)
     q = """SELECT DISTINCT * WHERE { %s }""" % where_gp
-    log.info(q)
 
     result = []
     try:
+        log.info('Querying fragment {}:\n{}'.format(fid, q))
         result = fragment_graph(fid).query(q)
     except Exception, e:  # ParseException from query
         traceback.print_exc()
@@ -360,6 +361,12 @@ def __update_result_set(fid, gp):
         if rows:
             table.insert_many([{label: row[row.labels[label]] for label in row.labels} for row in rows])
         log.info('{} rows inserted into fragment {} result set'.format(len(rows), fid))
+
+        with r.pipeline(transaction=True) as p:
+            p.multi()
+            p.set('{}:{}:rs'.format(fragments_key, fid), True)
+            p.execute()
+
     except Exception, e:
         traceback.print_exc()
         log.error(e.message)
@@ -371,20 +378,21 @@ def __update_fragment_cache(fid, gp):
     :param fid:
     :return:
     """
-    plan_tps = cache.get_context(fid).subjects(RDF.type, AGORA.TriplePattern)
-    cache.remove_context(cache.get_context('/' + fid))
+    plan_tps = fragments_cache.get_context(fid).subjects(RDF.type, AGORA.TriplePattern)
+    fragments_cache.remove_context(fragments_cache.get_context('/' + fid))
     for tp in plan_tps:
-        cache.remove_context(cache.get_context(str((fid, __extract_tp_from_plan(cache, tp)))))
+        fragments_cache.remove_context(
+            fragments_cache.get_context(str((fid, __extract_tp_from_plan(fragments_cache, tp)))))
 
     gp_graph = graph_from_gp(gp)
     roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
 
     fragment_triples = load_stream_triples(fid, calendar.timegm(dt.now().timetuple()))
     for c, s, p, o in fragment_triples:
-        cache.get_context(str((fid, c))).add((s, p, o))
-        cache.get_context('/' + fid).add((s, p, o))
+        fragments_cache.get_context(str((fid, c))).add((s, p, o))
+        fragments_cache.get_context('/' + fid).add((s, p, o))
         if c[0] in roots:
-            cache.get_context('/' + fid).add((s, RDF.type, STOA.Root))
+            fragments_cache.get_context('/' + fid).add((s, RDF.type, STOA.Root))
     with r.pipeline() as pipe:
         pipe.delete('{}:{}:stream'.format(fragments_key, fid))
         pipe.execute()
@@ -396,8 +404,8 @@ def __cache_plan_context(fid, graph):
     (triple patterns context) in the cache graph
     """
     try:
-        fid_context = cache.get_context(fid)
-        cache.remove_context(fid_context)
+        fid_context = fragments_cache.get_context(fid)
+        fragments_cache.remove_context(fid_context)
         tps = graph.subjects(RDF.type, AGORA.TriplePattern)
         for tp in tps:
             for (s, p, o) in graph.triples((tp, None, None)):
@@ -443,7 +451,6 @@ def __load_fragment_requests(fid):
         try:
             sinks_[rid] = build_response(rid).sink
         except Exception, e:
-            traceback.print_exc()
             log.warning(e.message)
             with r.pipeline(transaction=True) as p:
                 p.multi()
@@ -529,22 +536,23 @@ def __pull_fragment(fid):
                 lock.release()
                 if new_triple:
                     __consume_quad(fid, (context_tp[c], s, p, o), graph, sinks=r_sinks)
+                n_triples += 1
             except Exception, e:
                 log.warning(e.message)
                 traceback.print_exc()
 
-            if fragment_delta > 1000:
+            if fragment_delta > 10000:
                 fragment_delta = 0
                 log.info('Pulling fragment {} [{} kB]'.format(fid, fragment_weight / 1000.0))
 
-            # Update fragment requests
-            if r.scard('f{}:requests'.format(fragment_key)) != len(r_sinks):
-                r_sinks = __load_fragment_requests(fid)
+            if n_triples % 100 == 0:
+                # Update fragment requests
+                if r.scard('{}:requests'.format(fragment_key)) != len(r_sinks):
+                    r_sinks = __load_fragment_requests(fid)
 
-            n_triples += 1
             post_ts = datetime.now()
             elapsed = (post_ts - pre_ts).total_seconds()
-            throttling = (1.0 / COLLECT_THROTTLING) - elapsed
+            throttling = THROTTLING_TIME - elapsed
             if throttling > 0:
                 sleep(throttling)
     except Exception, e:
@@ -624,19 +632,23 @@ def fragment_on_demand(fid):
 
 
 def is_pulling(fid):
-    return r.get('{}:{}:pulling'.format((fragments_key, fid))) is not None
+    return r.get('{}:{}:pulling'.format(fragments_key, fid)) is not None
 
 
 def fragment_contexts(fid):
-    return r.smembers('{}:{}:contexts'.format((fragments_key, fid)))
+    return r.smembers('{}:{}:contexts'.format(fragments_key, fid))
 
 
 def is_fragment_synced(fid):
     return fragment_updated_on(fid) is not None
 
 
+def fragment_has_result_set(fid):
+    return r.get('{}:{}:rs'.format(fragments_key, fid)) is not None
+
+
 def fragment_graph(fid):
-    return cache.get_context('/' + fid)
+    return fragments_cache.get_context('/' + fid)
 
 
 # Create and start collector daemon
