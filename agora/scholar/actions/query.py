@@ -29,7 +29,7 @@ from datetime import datetime
 
 import networkx as nx
 from agora.scholar.actions import FragmentConsumerResponse
-from agora.scholar.daemons.fragment import fragment_lock, fragment_graph, fragments_key
+from agora.scholar.daemons.fragment import fragment_lock, fragment_graph, fragments_key, fragment_updated_on
 from agora.stoa.actions.core import STOA
 from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
 from agora.stoa.actions.core.utils import chunks, tp_parts
@@ -145,7 +145,7 @@ class QueryAction(FragmentAction):
         If the fragment is already synced at submission time, the delivery becomes ready
         """
         super(QueryAction, self).submit()
-        if fragment_has_result_set(self.sink.fragment_id):
+        if fragment_updated_on(self.sink.fragment_id) is not None:
             self.sink.delivery = 'ready'
 
 
