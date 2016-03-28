@@ -326,7 +326,7 @@ def query(fid, gp):
             return ' '.join([build_pattern_query(x) for x in out_edges])
         return ''
 
-    gp = filter(lambda x: ' a ' not in x and 'rdf:type' not in x, gp)
+    # gp = filter(lambda x: ' a ' not in x and 'rdf:type' not in x, gp)
     gp_parts = [tp_parts(tp) for tp in gp]
 
     blocks = []
