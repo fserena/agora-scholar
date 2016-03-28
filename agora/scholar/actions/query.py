@@ -24,18 +24,88 @@
 import calendar
 import json
 import logging
+import traceback
 from datetime import datetime
 
+import networkx as nx
 from agora.scholar.actions import FragmentConsumerResponse
-from agora.scholar.daemons.fragment import fragment_lock, fragment_has_result_set
+from agora.scholar.daemons.fragment import fragment_lock, fragment_graph, fragments_key
 from agora.stoa.actions.core import STOA
 from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
-from agora.stoa.actions.core.utils import chunks
+from agora.stoa.actions.core.utils import chunks, tp_parts
+from agora.stoa.store import r
 from agora.stoa.store.tables import db
 
 __author__ = 'Fernando Serena'
 
 log = logging.getLogger('agora.scholar.actions.query')
+
+
+def fragment_has_result_set(fid):
+    return r.get('{}:{}:rs'.format(fragments_key, fid)) is not None
+
+
+def _update_result_set(fid, gp):
+    try:
+        result_gen = query(fid, gp)
+        removed = db[fid].delete_many({}).deleted_count
+        log.info('{} rows removed from fragment {} result set'.format(removed, fid))
+        table = db[fid]
+        rows = set(result_gen)
+        if rows:
+            table.insert_many([{label: row[row.labels[label]] for label in row.labels} for row in rows])
+        log.info('{} rows inserted into fragment {} result set'.format(len(rows), fid))
+
+        with r.pipeline(transaction=True) as p:
+            p.multi()
+            p.set('{}:{}:rs'.format(fragments_key, fid), True)
+            p.execute()
+
+    except Exception, e:
+        traceback.print_exc()
+        log.error(e.message)
+
+
+def query(fid, gp):
+    """
+    Query the fragment using the original request graph pattern
+    :param gp:
+    :param fid:
+    :return: The query result
+    """
+
+    def __build_query_from(x, depth=0):
+        def build_pattern_query((u, v, data)):
+            return '\nOPTIONAL { %s %s %s %s }' % (u, data['predicate'], v, __build_query_from(v, depth + 1))
+
+        out_edges = list(gp_graph.out_edges_iter(x, data=True))
+        out_edges = reversed(sorted(out_edges, key=lambda x: gp_graph.out_degree))
+        if out_edges:
+            return ' '.join([build_pattern_query(x) for x in out_edges])
+        return ''
+
+    gp_parts = [tp_parts(tp) for tp in gp]
+
+    blocks = []
+    gp_graph = nx.DiGraph()
+    for gp_part in gp_parts:
+        gp_graph.add_edge(gp_part[0], gp_part[2], predicate=gp_part[1])
+
+    roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
+
+    blocks += ['%s a stoa:Root\nOPTIONAL { %s }' % (root, __build_query_from(root)) for root in roots]
+
+    where_gp = ' .\n'.join(blocks)
+    q = """SELECT DISTINCT * WHERE { %s }""" % where_gp
+
+    result = []
+    try:
+        log.info('Querying fragment {}:\n{}'.format(fid, q))
+        result = fragment_graph(fid).query(q)
+    except Exception, e:  # ParseException from query
+        traceback.print_exc()
+        log.warning(e.message)
+    return result
 
 
 class QueryRequest(FragmentRequest):
@@ -142,6 +212,9 @@ class QueryResponse(FragmentConsumerResponse):
         def extract_fields(result):
             for r in result:
                 yield r['_id']
+
+        if not r.exists('{}:{}:rs'.format(fragments_key, self.sink.fragment_id)):
+            _update_result_set(self.sink.fragment_id, self.sink.gp)
 
         pattern = {}
         projection = {}

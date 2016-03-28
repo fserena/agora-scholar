@@ -41,7 +41,6 @@ from agora.stoa.actions.core.utils import tp_parts
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
-from agora.stoa.store.tables import db
 from agora.stoa.store.triples import fragments_cache, add_stream_triple, load_stream_triples, graph_provider
 from concurrent.futures.thread import ThreadPoolExecutor
 from rdflib import RDF, RDFS
@@ -308,70 +307,6 @@ def graph_from_gp(gp):
     return gp_graph
 
 
-def query(fid, gp):
-    """
-    Query the fragment using the original request graph pattern
-    :param gp:
-    :param fid:
-    :return: The query result
-    """
-
-    def __build_query_from(x, depth=0):
-        def build_pattern_query((u, v, data)):
-            return '\nOPTIONAL { %s %s %s %s }' % (u, data['predicate'], v, __build_query_from(v, depth + 1))
-
-        out_edges = list(gp_graph.out_edges_iter(x, data=True))
-        out_edges = reversed(sorted(out_edges, key=lambda x: gp_graph.out_degree))
-        if out_edges:
-            return ' '.join([build_pattern_query(x) for x in out_edges])
-        return ''
-
-    # gp = filter(lambda x: ' a ' not in x and 'rdf:type' not in x, gp)
-    gp_parts = [tp_parts(tp) for tp in gp]
-
-    blocks = []
-    gp_graph = nx.DiGraph()
-    for gp_part in gp_parts:
-        gp_graph.add_edge(gp_part[0], gp_part[2], predicate=gp_part[1])
-
-    roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
-
-    blocks += ['%s a stoa:Root\nOPTIONAL { %s }' % (root, __build_query_from(root)) for root in roots]
-
-    where_gp = ' .\n'.join(blocks)
-    q = """SELECT DISTINCT * WHERE { %s }""" % where_gp
-
-    result = []
-    try:
-        log.info('Querying fragment {}:\n{}'.format(fid, q))
-        result = fragment_graph(fid).query(q)
-    except Exception, e:  # ParseException from query
-        traceback.print_exc()
-        log.warning(e.message)
-    return result
-
-
-def __update_result_set(fid, gp):
-    try:
-        result_gen = query(fid, gp)
-        removed = db[fid].delete_many({}).deleted_count
-        log.info('{} rows removed from fragment {} result set'.format(removed, fid))
-        table = db[fid]
-        rows = set(result_gen)
-        if rows:
-            table.insert_many([{label: row[row.labels[label]] for label in row.labels} for row in rows])
-        log.info('{} rows inserted into fragment {} result set'.format(len(rows), fid))
-
-        with r.pipeline(transaction=True) as p:
-            p.multi()
-            p.set('{}:{}:rs'.format(fragments_key, fid), True)
-            p.execute()
-
-    except Exception, e:
-        traceback.print_exc()
-        log.error(e.message)
-
-
 def __update_fragment_cache(fid, gp):
     """
     Recreate fragment <fid> cached data and all its data-contexts from the corresponding stream (Redis)
@@ -572,7 +507,7 @@ def __pull_fragment(fid):
         __cache_plan_context(fid, graph)
         log.info('BGP context of fragment {} has been cached'.format(fid))
         log.info('Updating result set for fragment {}...'.format(fid))
-        __update_result_set(fid, tps)
+        # __update_result_set(fid, tps)
 
         # Calculate sync times and update fragment flags
         with r.pipeline(transaction=True) as p:
@@ -641,10 +576,6 @@ def fragment_contexts(fid):
 
 def is_fragment_synced(fid):
     return fragment_updated_on(fid) is not None
-
-
-def fragment_has_result_set(fid):
-    return r.get('{}:{}:rs'.format(fragments_key, fid)) is not None
 
 
 def fragment_graph(fid):
