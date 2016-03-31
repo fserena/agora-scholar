@@ -37,7 +37,7 @@ from abc import abstractmethod, abstractproperty
 from agora.client.namespaces import AGORA
 from agora.client.wrapper import Agora
 from agora.stoa.actions.core import STOA, AGENT_ID
-from agora.stoa.actions.core.utils import tp_parts
+from agora.stoa.actions.core.utils import tp_parts, GraphPattern
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
@@ -254,17 +254,19 @@ def __notify_completion(fid, sinks):
         if sink.delivery == 'accepted':
             sink.delivery = 'ready'
 
-    for plugin in FragmentPlugin.plugins():
-        try:
-            filtered_sinks = filter(lambda _: isinstance(sinks[_], plugin.sink_class), sinks)
-            for rid in filtered_sinks:
-                sink = sinks[rid]
-                if plugin.sink_aware:
-                    plugin.complete(fid, sink)
-            if not plugin.sink_aware:
-                plugin.complete(fid)
-        except Exception as e:
-            log.warning(e.message)
+    if FragmentPlugin.plugins:
+        fragment_gp = GraphPattern(r.smembers('{}:fragments:{}:gp'.format(AGENT_ID, fid)))
+        for plugin in FragmentPlugin.plugins():
+            try:
+                filtered_sinks = filter(lambda _: isinstance(sinks[_], plugin.sink_class), sinks)
+                for rid in filtered_sinks:
+                    sink = sinks[rid]
+                    if plugin.sink_aware:
+                        plugin.complete(fid, sink)
+                if not plugin.sink_aware:
+                    plugin.complete(fid, fragment_gp)
+            except Exception as e:
+                log.warning(e.message)
 
 
 def __extract_tp_from_plan(graph, c):

@@ -29,7 +29,8 @@ from datetime import datetime
 
 import networkx as nx
 from agora.scholar.actions import FragmentConsumerResponse
-from agora.scholar.daemons.fragment import fragment_lock, fragment_graph, fragments_key, fragment_updated_on
+from agora.scholar.daemons.fragment import fragment_lock, fragment_graph, fragments_key, fragment_updated_on, \
+    FragmentPlugin
 from agora.stoa.actions.core import STOA
 from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
 from agora.stoa.actions.core.utils import chunks, tp_parts
@@ -47,7 +48,7 @@ def fragment_has_result_set(fid):
 
 def _update_result_set(fid, gp):
     try:
-        result_gen = query(fid, gp)
+        result_gen = _query(fid, gp)
         removed = db[fid].delete_many({}).deleted_count
         log.info('{} rows removed from fragment {} result set'.format(removed, fid))
         table = db[fid]
@@ -66,7 +67,7 @@ def _update_result_set(fid, gp):
         log.error(e.message)
 
 
-def query(fid, gp):
+def _query(fid, gp):
     """
     Query the fragment using the original request graph pattern
     :param gp:
@@ -106,6 +107,32 @@ def query(fid, gp):
         traceback.print_exc()
         log.warning(e.message)
     return result
+
+
+class QueryPlugin(FragmentPlugin):
+    @property
+    def sink_class(self):
+        return None
+
+    def consume(self, fid, quad, graph, *args):
+        pass
+
+    @property
+    def sink_aware(self):
+        return False
+
+    def complete(self, fid, *args):
+        fragment_gp = args[0]
+
+        try:
+            if fragment_has_result_set(fid):
+                _update_result_set(fid, fragment_gp)
+        except Exception, e:
+            traceback.print_exc()
+            log.error(e.message)
+
+
+FragmentPlugin.register(QueryPlugin)
 
 
 class QueryRequest(FragmentRequest):
