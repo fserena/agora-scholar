@@ -241,7 +241,7 @@ class QueryResponse(FragmentConsumerResponse):
                 yield r['_id']
 
         if not r.exists('{}:{}:rs'.format(fragments_key, self.sink.fragment_id)):
-            _update_result_set(self.sink.fragment_id, self.sink.gp)
+            _update_result_set(self.sink.fragment_id, self.sink.fragment_gp)
 
         pattern = {}
         projection = {}
