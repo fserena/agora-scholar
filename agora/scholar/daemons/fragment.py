@@ -528,7 +528,8 @@ def __pull_fragment(fid):
                 log.info('Fragment {} has been switched to on-demand mode'.format(fid))
             else:
                 p.delete(demand_key)
-                min_durability = int(max(MIN_SYNC, elapsed))
+                updating_delay = int(r.get('{}:ud'.format(fragment_key)))
+                min_durability = int(max(updating_delay, elapsed))
                 durability = random.randint(min_durability, min_durability * 2)
                 p.expire(sync_key, durability)
                 log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
