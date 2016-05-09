@@ -112,7 +112,7 @@ def _query(fid, gp):
 class QueryPlugin(FragmentPlugin):
     @property
     def sink_class(self):
-        return None
+        return QuerySink
 
     def consume(self, fid, quad, graph, *args):
         pass
