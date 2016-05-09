@@ -41,7 +41,8 @@ from agora.stoa.actions.core.utils import tp_parts, GraphPattern
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
-from agora.stoa.store.triples import fragments_cache, add_stream_triple, load_stream_triples, graph_provider
+from agora.stoa.store.triples import fragments_cache, add_stream_triple, clear_fragment_stream, load_stream_triples, \
+    graph_provider
 from concurrent.futures.thread import ThreadPoolExecutor
 from rdflib import RDF, RDFS
 
@@ -315,21 +316,22 @@ def __update_fragment_cache(fid, gp):
     :param fid:
     :return:
     """
-    plan_tps = fragments_cache.get_context(fid).subjects(RDF.type, AGORA.TriplePattern)
     fragments_cache.remove_context(fragments_cache.get_context('/' + fid))
-    for tp in plan_tps:
-        fragments_cache.remove_context(
-            fragments_cache.get_context(str((fid, __extract_tp_from_plan(fragments_cache, tp)))))
 
     gp_graph = graph_from_gp(gp)
     roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
 
     fragment_triples = load_stream_triples(fid, calendar.timegm(dt.now().timetuple()))
+    visited_contexts = set([])
     for c, s, p, o in fragment_triples:
+        if c not in visited_contexts:
+            fragments_cache.remove_context(fragments_cache.get_context(str((fid, c))))
+            visited_contexts.add(c)
         fragments_cache.get_context(str((fid, c))).add((s, p, o))
         fragments_cache.get_context('/' + fid).add((s, p, o))
         if c[0] in roots:
             fragments_cache.get_context('/' + fid).add((s, RDF.type, STOA.Root))
+    visited_contexts.clear()
     with r.pipeline() as pipe:
         pipe.delete('{}:{}:stream'.format(fragments_key, fid))
         pipe.execute()
@@ -349,7 +351,7 @@ def __cache_plan_context(fid, graph):
                 fid_context.add((s, p, o))
                 for t in graph.triples((o, None, None)):
                     fid_context.add(t)
-    except Exception, e:
+    except Exception as e:
         log.error(e.message)
 
 
@@ -387,7 +389,7 @@ def __load_fragment_requests(fid):
     for rid in r.smembers(fragment_requests_key):
         try:
             sinks_[rid] = build_response(rid).sink
-        except Exception, e:
+        except Exception as e:
             log.warning(e.message)
             with r.pipeline(transaction=True) as p:
                 p.multi()
@@ -418,6 +420,7 @@ def __pull_fragment(fid):
         fgm_gen, _, graph = agora_client.get_fragment_generator('{ %s }' % ' . '.join(tps), workers=N_COLLECTORS,
                                                                 provider=graph_provider, queue_size=N_COLLECTORS)
     except Exception:
+        traceback.print_exc()
         log.error('Agora is not available')
         return
 
@@ -446,6 +449,7 @@ def __pull_fragment(fid):
         p.set('{}:pulling'.format(fragment_key), True)
         contexts_key = '{}:contexts'.format(fragment_key)
         p.delete(contexts_key)
+        clear_fragment_stream(fid)
         for tpn in context_tp.keys():
             p.sadd(contexts_key, frag_contexts[tpn])
         p.execute()
@@ -474,7 +478,7 @@ def __pull_fragment(fid):
                 if new_triple:
                     __consume_quad(fid, (context_tp[c], s, p, o), graph, sinks=r_sinks)
                 n_triples += 1
-            except Exception, e:
+            except Exception as e:
                 log.warning(e.message)
                 traceback.print_exc()
 
@@ -492,7 +496,7 @@ def __pull_fragment(fid):
             throttling = THROTTLING_TIME - elapsed
             if throttling > 0:
                 sleep(throttling)
-    except Exception, e:
+    except Exception as e:
         log.warning(e.message)
         traceback.print_exc()
 
@@ -528,7 +532,7 @@ def __pull_fragment(fid):
                 durability = random.randint(min_durability, min_durability * 2)
                 p.expire(sync_key, durability)
                 log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
-            p.set('{}:updated'.format(fragment_key), dt.now())
+            p.set('{}:updated'.format(fragment_key), calendar.timegm(dt.now().timetuple()))
             p.delete('{}:pulling'.format(fragment_key))
             p.execute()
 

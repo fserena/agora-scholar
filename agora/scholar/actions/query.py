@@ -62,7 +62,7 @@ def _update_result_set(fid, gp):
             p.set('{}:{}:rs'.format(fragments_key, fid), True)
             p.execute()
 
-    except Exception, e:
+    except Exception as e:
         traceback.print_exc()
         log.error(e.message)
 
@@ -103,7 +103,7 @@ def _query(fid, gp):
     try:
         log.info('Querying fragment {}:\n{}'.format(fid, q))
         result = fragment_graph(fid).query(q)
-    except Exception, e:  # ParseException from query
+    except Exception as e:  # ParseException from query
         traceback.print_exc()
         log.warning(e.message)
     return result
