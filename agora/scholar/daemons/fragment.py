@@ -533,11 +533,11 @@ def __pull_fragment(fid):
             updated_delay = int(r.get('{}:ud'.format(fragment_key)))
             last_requests_ts = map(lambda x: int(x), r.lrange('{}:hist'.format(fragment_key), 0, -1))
             print last_requests_ts
-            # current_ts = calendar.timegm(datetime.now().timetuple())
-            # first_collection = r.get('{}:updated'.format(fragment_key)) is None
+            current_ts = calendar.timegm(datetime.now().timetuple())
+            first_collection = r.get('{}:updated'.format(fragment_key)) is None
             base_ts = last_requests_ts[:]
-            # if not first_collection:
-            #     base_ts = [current_ts] + base_ts
+            if not first_collection:
+                base_ts = [current_ts] + base_ts
             request_intervals = [i - j for i, j in zip(base_ts[:-1], base_ts[1:])]
             if request_intervals:
                 avg_gap = reduce(lambda x, y: x + y, request_intervals) / len(request_intervals)
