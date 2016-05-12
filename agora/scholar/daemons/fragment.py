@@ -463,8 +463,8 @@ def __pull_fragment(fid):
     log.info('Collecting fragment {}...'.format(fid))
     try:
         # Iterate all fragment triples and their contexts
+        pre_ts = datetime.now()
         for (c, s, p, o) in fgm_gen:
-            pre_ts = datetime.now()
             # Update weights and counters
             triple_weight = len(u'{}{}{}'.format(s, p, o))
             fragment_weight += triple_weight
@@ -495,7 +495,9 @@ def __pull_fragment(fid):
             elapsed = (post_ts - pre_ts).total_seconds()
             throttling = THROTTLING_TIME - elapsed
             if throttling > 0:
+                print('waiting because of collect throttling')
                 sleep(throttling)
+            pre_ts = datetime.now()
     except Exception as e:
         log.warning(e.message)
         traceback.print_exc()
@@ -513,7 +515,6 @@ def __pull_fragment(fid):
         __cache_plan_context(fid, graph)
         log.info('BGP context of fragment {} has been cached'.format(fid))
         log.info('Updating result set for fragment {}...'.format(fid))
-        # __update_result_set(fid, tps)
 
         # Calculate sync times and update fragment flags
         with r.pipeline(transaction=True) as p:
@@ -523,16 +524,35 @@ def __pull_fragment(fid):
             # Fragment is now synced
             p.set(sync_key, True)
             # If the fragment collection time has not exceeded the threshold, switch to on-demand mode
-            if elapsed < ON_DEMAND_TH and elapsed * random.random() < ON_DEMAND_TH / 4:
-                p.set(demand_key, True)
-                log.info('Fragment {} has been switched to on-demand mode'.format(fid))
+            # if elapsed < ON_DEMAND_TH and elapsed * random.random() < ON_DEMAND_TH / 4:
+            #     p.set(demand_key, True)
+            #     log.info('Fragment {} has been switched to on-demand mode'.format(fid))
+            # else:
+            p.delete(demand_key)
+
+            updated_delay = int(r.get('{}:ud'.format(fragment_key)))
+            last_requests_ts = map(lambda x: int(x), r.lrange('{}:hist'.format(fragment_key), 0, -1))
+            print last_requests_ts
+            # current_ts = calendar.timegm(datetime.now().timetuple())
+            # first_collection = r.get('{}:updated'.format(fragment_key)) is None
+            base_ts = last_requests_ts[:]
+            # if not first_collection:
+            #     base_ts = [current_ts] + base_ts
+            request_intervals = [i - j for i, j in zip(base_ts[:-1], base_ts[1:])]
+            if request_intervals:
+                avg_gap = reduce(lambda x, y: x + y, request_intervals) / len(request_intervals)
+                print avg_gap,
+                durability = avg_gap - elapsed if avg_gap > updated_delay else updated_delay - elapsed
             else:
-                p.delete(demand_key)
-                updating_delay = int(r.get('{}:ud'.format(fragment_key)))
-                min_durability = int(max(updating_delay, elapsed))
-                durability = random.randint(min_durability, min_durability * 2)
+                durability = updated_delay - elapsed
+
+            durability = int(max(durability, elapsed))
+            print durability
+            # durability = random.randint(min_durability, min_durability)
+            if durability <= updated_delay:
                 p.expire(sync_key, durability)
-                log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
+            log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
+
             p.set('{}:updated'.format(fragment_key), calendar.timegm(dt.now().timetuple()))
             p.delete('{}:pulling'.format(fragment_key))
             p.execute()
