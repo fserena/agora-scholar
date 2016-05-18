@@ -23,26 +23,24 @@
 """
 import calendar
 import logging
-import random
 import time
 import traceback
 from datetime import datetime as dt, datetime
 from threading import Thread
 from time import sleep
 
-from redis.lock import Lock
-
 import networkx as nx
 from abc import abstractmethod, abstractproperty
 from agora.client.namespaces import AGORA
 from agora.client.wrapper import Agora
 from agora.stoa.actions.core import STOA, AGENT_ID
+from agora.stoa.actions.core.fragment import fragments_key, fragment_lock
 from agora.stoa.actions.core.utils import tp_parts, GraphPattern
 from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
 from agora.stoa.store.triples import fragments_cache, add_stream_triple, clear_fragment_stream, load_stream_triples, \
-    graph_provider
+    GraphProvider
 from concurrent.futures.thread import ThreadPoolExecutor
 from rdflib import RDF, RDFS
 
@@ -59,8 +57,6 @@ MAX_CONCURRENT_FRAGMENTS = int(app.config.get('PARAMS', {}).get('max_concurrent_
 COLLECT_THROTTLING = max(1, int(app.config.get('PARAMS', {}).get('collect_throttling', 30)))
 THROTTLING_TIME = (1.0 / (COLLECT_THROTTLING * 1000))
 
-fragments_key = '{}:fragments'.format(AGENT_ID)
-
 log.info("""Fragment daemon setup:
                     - On-demand threshold: {}
                     - Minimum sync time: {}
@@ -71,6 +67,9 @@ log.info("""Fragment daemon setup:
 # Fragment collection threadpool
 thp = ThreadPoolExecutor(max_workers=min(8, MAX_CONCURRENT_FRAGMENTS))
 
+# Create a graph provider
+graph_provider = GraphProvider()
+
 log.info('Cleaning fragment locks...')
 fragment_locks = r.keys('{}:*lock*'.format(fragments_key))
 for flk in fragment_locks:
@@ -80,15 +79,6 @@ log.info('Cleaning fragment pulling flags...')
 fragment_pullings = r.keys('{}:*:pulling'.format(fragments_key))
 for fpk in fragment_pullings:
     r.delete(fpk)
-
-
-def fragment_lock(fid):
-    """
-    :param fid: Fragment id
-    :return: A redis-based lock object for a given fragment
-    """
-    lock_key = '{}:{}:lock'.format(fragments_key, fid)
-    return r.lock(lock_key, lock_class=Lock)
 
 
 class FragmentPlugin(object):
@@ -321,7 +311,7 @@ def __update_fragment_cache(fid, gp):
     gp_graph = graph_from_gp(gp)
     roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
 
-    fragment_triples = load_stream_triples(fid, calendar.timegm(dt.now().timetuple()))
+    fragment_triples = load_stream_triples(fid, calendar.timegm(dt.utcnow().timetuple()))
     visited_contexts = set([])
     for c, s, p, o in fragment_triples:
         if c not in visited_contexts:
@@ -415,7 +405,7 @@ def __pull_fragment(fid):
                     - Supporting: ({}) {}""".format(fid, list(tps), len(r_sinks), list(r_sinks)))
 
     # Prepare the corresponding fragment generator and fetch the search plan
-    start_time = datetime.now()
+    start_time = datetime.utcnow()
     try:
         fgm_gen, _, graph = agora_client.get_fragment_generator('{ %s }' % ' . '.join(tps), workers=N_COLLECTORS,
                                                                 provider=graph_provider, queue_size=N_COLLECTORS)
@@ -463,7 +453,7 @@ def __pull_fragment(fid):
     log.info('Collecting fragment {}...'.format(fid))
     try:
         # Iterate all fragment triples and their contexts
-        pre_ts = datetime.now()
+        pre_ts = datetime.utcnow()
         for (c, s, p, o) in fgm_gen:
             # Update weights and counters
             triple_weight = len(u'{}{}{}'.format(s, p, o))
@@ -491,18 +481,18 @@ def __pull_fragment(fid):
                 if r.scard('{}:requests'.format(fragment_key)) != len(r_sinks):
                     r_sinks = __load_fragment_requests(fid)
 
-            post_ts = datetime.now()
+            post_ts = datetime.utcnow()
             elapsed = (post_ts - pre_ts).total_seconds()
             throttling = THROTTLING_TIME - elapsed
             if throttling > 0:
                 print('waiting because of collect throttling')
                 sleep(throttling)
-            pre_ts = datetime.now()
+            pre_ts = datetime.utcnow()
     except Exception as e:
         log.warning(e.message)
         traceback.print_exc()
 
-    elapsed = (datetime.now() - start_time).total_seconds()
+    elapsed = (datetime.utcnow() - start_time).total_seconds()
     log.info(
         '{} triples retrieved for fragment {} in {} s [{} kB]'.format(n_triples, fid, elapsed,
                                                                       fragment_weight / 1000.0))
@@ -533,10 +523,12 @@ def __pull_fragment(fid):
             updated_delay = int(r.get('{}:ud'.format(fragment_key)))
             last_requests_ts = map(lambda x: int(x), r.lrange('{}:hist'.format(fragment_key), 0, -1))
             print last_requests_ts
-            current_ts = calendar.timegm(datetime.now().timetuple())
+            current_ts = calendar.timegm(datetime.utcnow().timetuple())
             first_collection = r.get('{}:updated'.format(fragment_key)) is None
             base_ts = last_requests_ts[:]
             if not first_collection:
+                if current_ts - base_ts[0] <= updated_delay:
+                    current_ts += updated_delay  # Force
                 base_ts = [current_ts] + base_ts
             request_intervals = [i - j for i, j in zip(base_ts[:-1], base_ts[1:])]
             if request_intervals:
@@ -546,14 +538,16 @@ def __pull_fragment(fid):
             else:
                 durability = updated_delay - elapsed
 
-            durability = int(max(durability, elapsed))
+            durability = int(max(durability, 1))
             print durability
-            # durability = random.randint(min_durability, min_durability)
             if durability <= updated_delay:
                 p.expire(sync_key, durability)
-            log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
+                log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
+            else:
+                clear_fragment_stream(fid)
+                log.info('Fragment {} will no longer be automatically updated'.format(fid))
 
-            p.set('{}:updated'.format(fragment_key), calendar.timegm(dt.now().timetuple()))
+            p.set('{}:updated'.format(fragment_key), calendar.timegm(dt.utcnow().timetuple()))
             p.delete('{}:pulling'.format(fragment_key))
             p.execute()
 
@@ -573,16 +567,20 @@ def __collect_fragments():
 
     futures = {}
     while True:
-        for fid in filter(
-                lambda x: r.get('{}:{}:sync'.format(fragments_key, x)) is None and r.get(
-                    '{}:{}:pulling'.format(fragments_key, x)) is None,
-                r.smembers(fragments_key)):
-            if fid in futures:
-                if futures[fid].done():
-                    del futures[fid]
-            if fid not in futures:
-                futures[fid] = thp.submit(__pull_fragment, fid)
-        time.sleep(1)
+        try:
+            for fid in filter(
+                    lambda x: r.get('{}:{}:sync'.format(fragments_key, x)) is None and r.get(
+                        '{}:{}:pulling'.format(fragments_key, x)) is None,
+                    r.smembers(fragments_key)):
+                if fid in futures:
+                    if futures[fid].done():
+                        del futures[fid]
+                if fid not in futures:
+                    futures[fid] = thp.submit(__pull_fragment, fid)
+        except Exception as e:
+            log.error(e.message)
+        finally:
+            time.sleep(1)
 
 
 def fragment_updated_on(fid):

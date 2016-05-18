@@ -222,7 +222,7 @@ class QueryResponse(FragmentConsumerResponse):
                 if result_rows:
                     yield json.dumps(result_rows), {'state': 'streaming', 'source': 'store',
                                                     'response_to': self.sink.message_id,
-                                                    'submitted_on': calendar.timegm(datetime.now().timetuple()),
+                                                    'submitted_on': calendar.timegm(datetime.utcnow().timetuple()),
                                                     'submitted_by': self.sink.submitted_by,
                                                     'format': 'json'}
         except Exception, e:

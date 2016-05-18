@@ -31,6 +31,7 @@ from agora.scholar.actions import FragmentConsumerResponse
 from agora.scholar.daemons.fragment import FragmentPlugin, map_variables, match_filter, is_fragment_synced, \
     fragment_contexts
 from agora.scholar.daemons.fragment import fragment_lock
+from agora.stoa.actions.core import AGENT_ID
 from agora.stoa.actions.core import STOA
 from agora.stoa.actions.core.fragment import FragmentRequest, FragmentAction, FragmentSink
 from agora.stoa.actions.core.utils import parse_bool, chunks
@@ -41,6 +42,11 @@ from agora.stoa.store.triples import load_stream_triples, fragments_cache
 __author__ = 'Fernando Serena'
 
 log = logging.getLogger('agora.scholar.actions.stream')
+
+log.info("'Cleaning stream requests' locks...")
+request_locks = r.keys('{}:requests:*:lock'.format(AGENT_ID))
+for rlk in request_locks:
+    r.delete(rlk)
 
 
 class StreamPlugin(FragmentPlugin):
@@ -59,10 +65,10 @@ class StreamPlugin(FragmentPlugin):
 
             # Proceed only if the stream flag is enabled
             if sink.stream:
-                log.debug('[{}] Streaming fragment triple...'.format(sink.request_id))
+                # log.info('[{}] Streaming fragment triple...'.format(sink.request_id))
                 reply((c, s.n3(), p.n3(), o.n3()), headers={'source': 'stream', 'format': 'tuple', 'state': 'streaming',
                                                             'response_to': sink.message_id,
-                                                            'submitted_on': calendar.timegm(datetime.now().timetuple()),
+                                                            'submitted_on': calendar.timegm(datetime.utcnow().timetuple()),
                                                             'submitted_by': sink.submitted_by},
                       **sink.recipient)
         finally:
@@ -131,8 +137,12 @@ class StreamSink(FragmentSink):
     """
 
     def _remove(self, pipe):
-        super(StreamSink, self)._remove(pipe)
-        pipe.delete('{}lock'.format(self._request_key))
+        try:
+            self.lock.acquire()
+            super(StreamSink, self)._remove(pipe)
+            pipe.delete('{}lock'.format(self._request_key))
+        except Exception as e:
+            log.warning(e.message)
 
     def __init__(self):
         super(StreamSink, self).__init__()
@@ -185,7 +195,7 @@ class StreamResponse(FragmentConsumerResponse):
         :return: Quads like (context, subject, predicate, object)
         """
 
-        timestamp = calendar.timegm(dt.now().timetuple())
+        timestamp = calendar.timegm(dt.utcnow().timetuple())
         fragment = None
 
         self.sink.lock.acquire()
@@ -198,6 +208,7 @@ class StreamResponse(FragmentConsumerResponse):
                 else:
                     self.sink.delivery = 'streaming'
             else:
+                self.sink.stream = False
                 if fragment:
                     self.sink.delivery = 'pushing'
                     log.debug('Fragment retrieved from cache for request number {}'.format(self._request_id))
@@ -205,7 +216,6 @@ class StreamResponse(FragmentConsumerResponse):
                     self.sink.delivery = 'sent'
                     log.debug('Sending end stream signal since there is no fragment and stream is disabled')
                     yield (), {'state': 'end', 'format': 'tuple'}
-                self.sink.stream = False
         except Exception as e:
             log.warning(e.message)
             self.sink.stream = True
@@ -234,7 +244,7 @@ class StreamResponse(FragmentConsumerResponse):
                                      'state': 'streaming',
                                      'response_to': self.sink.message_id,
                                      'submitted_on': calendar.timegm(
-                                         datetime.now().timetuple()),
+                                         datetime.utcnow().timetuple()),
                                      'submitted_by': self.sink.submitted_by}
             finally:
                 self.__fragment_lock.release()
@@ -261,7 +271,7 @@ class StreamResponse(FragmentConsumerResponse):
                     yield triple_patterns[context], s, p, o
 
         if timestamp is None:
-            timestamp = calendar.timegm(dt.now().timetuple())
+            timestamp = calendar.timegm(dt.utcnow().timetuple())
 
         self.__fragment_lock.acquire()
         try:
