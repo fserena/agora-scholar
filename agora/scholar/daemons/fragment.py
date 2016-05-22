@@ -540,11 +540,13 @@ def __pull_fragment(fid):
 
             durability = int(max(durability, 1))
             print durability
-            if durability <= updated_delay:
+            if durability <= updated_delay - elapsed:
                 p.expire(sync_key, durability)
                 log.info('Fragment {} is considered synced for {} s'.format(fid, durability))
             else:
                 clear_fragment_stream(fid)
+                p.delete('{}:updated'.format(fragment_key))
+                p.delete('{}:hist'.format(fragment_key))
                 log.info('Fragment {} will no longer be automatically updated'.format(fid))
 
             p.set('{}:updated'.format(fragment_key), calendar.timegm(dt.utcnow().timetuple()))
@@ -580,7 +582,7 @@ def __collect_fragments():
         except Exception as e:
             log.error(e.message)
         finally:
-            time.sleep(1)
+            time.sleep(0.1)
 
 
 def fragment_updated_on(fid):
