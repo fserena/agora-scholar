@@ -40,9 +40,10 @@ from agora.stoa.daemons.delivery import build_response
 from agora.stoa.server import app
 from agora.stoa.store import r
 from agora.stoa.store.triples import fragments_cache, add_stream_triple, clear_fragment_stream, load_stream_triples, \
-    GraphProvider
+    GraphProvider, event_resource_callbacks
 from concurrent.futures.thread import ThreadPoolExecutor
 from rdflib import RDF, RDFS
+from rdflib.term import URIRef
 
 __author__ = 'Fernando Serena'
 
@@ -79,6 +80,10 @@ log.info('Cleaning fragment pulling flags...')
 fragment_pullings = r.keys('{}:*:pulling'.format(fragments_key))
 for fpk in fragment_pullings:
     r.delete(fpk)
+
+resource_in_fragment = {}
+fragment_resources = {}
+resource_events = {}
 
 
 class FragmentPlugin(object):
@@ -388,6 +393,32 @@ def __load_fragment_requests(fid):
     return sinks_
 
 
+def init_fragment_resources(fid):
+    if fid in fragment_resources:
+        for s in fragment_resources[fid]:
+            if s in resource_in_fragment:
+                resource_in_fragment[s].remove(fid)
+        del fragment_resources[fid]
+    fragment_resources[fid] = set([])
+
+
+def resource_callback(resource):
+    resource_events[resource] = datetime.utcnow()
+
+
+# event_resource_callbacks.add(resource_callback)
+
+
+def change_in_fragment_resource(fid, last_ts):
+    if last_ts is None:
+        return True
+    last = datetime.utcfromtimestamp(int(last_ts))
+    if fid in fragment_resources:
+        if fragment_resources[fid]:
+            return any([str(s) in resource_events and resource_events[str(s)] >= last for s in fragment_resources[fid]])
+    return True
+
+
 def __pull_fragment(fid):
     """
     Pull and replace (if needed) a given fragment
@@ -395,6 +426,9 @@ def __pull_fragment(fid):
     """
 
     fragment_key = '{}:{}'.format(fragments_key, fid)
+
+    # if not change_in_fragment_resource(fid, fragment_updated_on(fid)):
+    #     return
 
     # Load fragment graph pattern
     tps = r.smembers('{}:gp'.format(fragment_key))
@@ -404,11 +438,14 @@ def __pull_fragment(fid):
                     - GP: {}
                     - Supporting: ({}) {}""".format(fid, list(tps), len(r_sinks), list(r_sinks)))
 
+    init_fragment_resources(fid)
+
     # Prepare the corresponding fragment generator and fetch the search plan
     start_time = datetime.utcnow()
     try:
         fgm_gen, _, graph = agora_client.get_fragment_generator('{ %s }' % ' . '.join(tps), workers=N_COLLECTORS,
                                                                 provider=graph_provider, queue_size=N_COLLECTORS)
+
     except Exception:
         traceback.print_exc()
         log.error('Agora is not available')
@@ -466,6 +503,11 @@ def __pull_fragment(fid):
                 new_triple = add_stream_triple(fid, context_tp[c], (s, p, o))
                 lock.release()
                 if new_triple:
+                    if isinstance(s, URIRef):
+                        if s not in resource_in_fragment:
+                            resource_in_fragment[s] = set([])
+                        resource_in_fragment[s].add(fid)
+                        fragment_resources[fid].add(s)
                     __consume_quad(fid, (context_tp[c], s, p, o), graph, sinks=r_sinks)
                 n_triples += 1
             except Exception as e:
