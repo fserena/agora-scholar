@@ -116,6 +116,9 @@ class QueryPlugin(FragmentPlugin):
 
     def consume(self, fid, quad, graph, *args):
         pass
+        intermediate_fid_key = '{}:{}:int'.format(fragments_key, fid)
+        (subj, _, obj) = quad[0]
+        r.sadd(intermediate_fid_key + ':{}:{}'.format(subj, obj), (quad[1], quad[3]))
 
     @property
     def sink_aware(self):
@@ -130,6 +133,9 @@ class QueryPlugin(FragmentPlugin):
         except Exception, e:
             traceback.print_exc()
             log.error(e.message)
+
+        intermediate_fid_key = '{}:{}:int'.format(fragments_key, fid)
+        r.delete(intermediate_fid_key)
 
 
 FragmentPlugin.register(QueryPlugin)
