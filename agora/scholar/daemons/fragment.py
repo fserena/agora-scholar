@@ -406,7 +406,7 @@ def resource_callback(resource):
     resource_events[resource] = datetime.utcnow()
 
 
-# event_resource_callbacks.add(resource_callback)
+event_resource_callbacks.add(resource_callback)
 
 
 def change_in_fragment_resource(fid, last_ts):
@@ -426,9 +426,19 @@ def __pull_fragment(fid):
     """
 
     fragment_key = '{}:{}'.format(fragments_key, fid)
+    on_events = r.get('{}:events'.format(fragment_key))
 
-    # if not change_in_fragment_resource(fid, fragment_updated_on(fid)):
-    #     return
+    if on_events == 'True' and not change_in_fragment_resource(fid, fragment_updated_on(fid)):
+        with r.pipeline(transaction=True) as p:
+            p.multi()
+            sync_key = '{}:sync'.format(fragment_key)
+            p.set(sync_key, True)
+            durability = int(r.get('{}:ud'.format(fragment_key)))
+            p.expire(sync_key, durability)
+            p.set('{}:updated'.format(fragment_key), calendar.timegm(dt.utcnow().timetuple()))
+            p.delete('{}:pulling'.format(fragment_key))
+            p.execute()
+        return
 
     # Load fragment graph pattern
     tps = r.smembers('{}:gp'.format(fragment_key))
@@ -444,7 +454,7 @@ def __pull_fragment(fid):
     start_time = datetime.utcnow()
     try:
         fgm_gen, _, graph = agora_client.get_fragment_generator('{ %s }' % ' . '.join(tps), workers=N_COLLECTORS,
-                                                                provider=graph_provider, queue_size=N_COLLECTORS)
+                                                                provider=graph_provider, queue_size=N_COLLECTORS*100)
 
     except Exception:
         traceback.print_exc()
@@ -527,7 +537,6 @@ def __pull_fragment(fid):
             elapsed = (post_ts - pre_ts).total_seconds()
             throttling = THROTTLING_TIME - elapsed
             if throttling > 0:
-                print('waiting because of collect throttling')
                 sleep(throttling)
             pre_ts = datetime.utcnow()
     except Exception as e:

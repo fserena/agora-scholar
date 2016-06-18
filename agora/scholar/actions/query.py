@@ -49,6 +49,9 @@ def fragment_has_result_set(fid):
 def _update_result_set(fid, gp):
     try:
         result_gen = _query(fid, gp)
+        # solutions = _build_solutions(fid, gp)
+        # for s in solutions:
+        #     print s
         removed = db[fid].delete_many({}).deleted_count
         log.info('{} rows removed from fragment {} result set'.format(removed, fid))
         table = db[fid]
@@ -65,6 +68,26 @@ def _update_result_set(fid, gp):
     except Exception as e:
         traceback.print_exc()
         log.error(e.message)
+
+
+# def _build_solutions(fid, gp):
+    # gp_parts = [tp_parts(tp) for tp in gp]
+
+    # gp_graph = nx.DiGraph()
+    # for gp_part in gp_parts:
+    #     gp_graph.add_edge(gp_part[0], gp_part[2], predicate=gp_part[1])
+    #
+    # roots = filter(lambda x: gp_graph.in_degree(x) == 0, gp_graph.nodes())
+    #
+    # sorted_pairs = []
+    # gp_graph.edges()
+    # for root in roots:
+    #     succs = gp_graph.successors(root)
+    #     sort
+
+
+
+    # yield fid
 
 
 def _query(fid, gp):
@@ -116,9 +139,10 @@ class QueryPlugin(FragmentPlugin):
 
     def consume(self, fid, quad, graph, *args):
         pass
-        intermediate_fid_key = '{}:{}:int'.format(fragments_key, fid)
-        (subj, _, obj) = quad[0]
-        r.sadd(intermediate_fid_key + ':{}:{}'.format(subj, obj), (quad[1], quad[3]))
+        # (subj, _, obj) = quad[0]
+        # collection_name = '{}:{}:{}:{}'.format(fragments_key, fid, subj, obj)
+
+        # db[collection_name].insert({subj: str(quad[1]), obj: str(quad[3])})
 
     @property
     def sink_aware(self):
@@ -134,8 +158,16 @@ class QueryPlugin(FragmentPlugin):
             traceback.print_exc()
             log.error(e.message)
 
-        intermediate_fid_key = '{}:{}:int'.format(fragments_key, fid)
-        r.delete(intermediate_fid_key)
+        # collection_prefix = '{}:{}'.format(fragments_key, fid)
+        # for c in filter(lambda x: x.startswith(collection_prefix),
+        #                 db.collection_names(include_system_collections=False)):
+        #     db.drop_collection(c)
+            # collection_name = '{}:{}:{}:{}'.format(fragments_key, fid, subj, obj)
+            # # intermediate_fid_keys = r.keys('{}:{}:int*'.format(fragments_key, fid))
+            # with r.pipeline() as p:
+            #     for ifk in intermediate_fid_keys:
+            #         p.delete(ifk)
+            #     p.execute()
 
 
 FragmentPlugin.register(QueryPlugin)
