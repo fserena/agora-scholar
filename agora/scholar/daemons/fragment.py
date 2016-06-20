@@ -26,6 +26,7 @@ import logging
 import time
 import traceback
 from datetime import datetime as dt, datetime
+from datetime import timedelta
 from threading import Thread
 from time import sleep
 
@@ -409,10 +410,10 @@ def resource_callback(resource):
 event_resource_callbacks.add(resource_callback)
 
 
-def change_in_fragment_resource(fid, last_ts):
-    if last_ts is None:
+def change_in_fragment_resource(fid, lapse):
+    if lapse is None:
         return True
-    last = datetime.utcfromtimestamp(int(last_ts))
+    last = datetime.utcnow() - timedelta(seconds=lapse * 3)
     if fid in fragment_resources:
         if fragment_resources[fid]:
             return any([str(s) in resource_events and resource_events[str(s)] >= last for s in fragment_resources[fid]])
@@ -428,7 +429,7 @@ def __pull_fragment(fid):
     fragment_key = '{}:{}'.format(fragments_key, fid)
     on_events = r.get('{}:events'.format(fragment_key))
 
-    if on_events == 'True' and not change_in_fragment_resource(fid, fragment_updated_on(fid)):
+    if on_events == 'True' and not change_in_fragment_resource(fid, int(r.get('{}:ud'.format(fragment_key)))):
         with r.pipeline(transaction=True) as p:
             p.multi()
             sync_key = '{}:sync'.format(fragment_key)
