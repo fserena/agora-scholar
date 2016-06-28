@@ -460,6 +460,7 @@ def __pull_fragment(fid):
     except Exception:
         traceback.print_exc()
         log.error('Agora is not available')
+        sleep(1)
         return
 
     # In case there is not SearchTree in the plan: notify, remove and abort collection
