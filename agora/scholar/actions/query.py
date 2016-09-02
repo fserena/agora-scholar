@@ -57,7 +57,7 @@ def _update_result_set(fid, gp):
         table = db[fid]
         rows = set(result_gen)
         if rows:
-            table.insert_many([{label: row[row.labels[label]] for label in row.labels} for row in rows])
+            table.insert_many([{label: row[row.labels[label]].toPython() for label in row.labels} for row in rows])
         log.info('{} rows inserted into fragment {} result set'.format(len(rows), fid))
 
         with r.pipeline(transaction=True) as p:
